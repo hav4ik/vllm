@@ -217,6 +217,40 @@ Per-config means with both runs collapsed:
   caching attacks the dominant cost (prefill); EAGLE-3 attacks the
   smaller cost (decode).
 
+### Production-scale: `--max-num-seqs 64`
+
+The runs above use `--max-num-seqs 16` for clarity (smaller
+parallelism = smaller queueing effects to disentangle from the spec
+decode signal). The user's actual production reference command uses
+`--max-num-seqs 64`, so the head-to-head was rerun at that batch size
+with `--max_parallel 32` on the trace collector to keep the queue
+saturated.
+
+| Metric | PC (seqs=64) | EAGLE-3 spec=3 (seqs=64) |
+| --- | --- | --- |
+| Per-session accuracy | **95.8%** (115/120) | 90.8% (109/120) |
+| Majority-vote accuracy (n=4) | **100.0%** (30/30) | **96.7%** (29/30) |
+| Total wall time (120 sessions) | **~19 min** | ~20 min |
+| Aggregate tokens/s (gen, mean over run) | ~1,140 | ~1,090 |
+| Sessions w/ max_turns/token_limit/no_answer | 5 | 11 |
+
+**At production batch size, Eagle3's wall-time gap closes** (~5%
+slower vs ~13% slower at seqs=16) because the verifier is already
+better utilized at higher concurrency, so the relative cost of the
+spec-decode overhead shrinks.
+
+**But PC still wins on accuracy at every level**: per-session 95.8%
+vs 90.8% (5 percentage-point gap), and the majority-vote score
+actually *drops below 100%* for EAGLE-3 — one AIME problem had all
+4 sessions fail, vs zero such problems for PC. This drop of
+majority-vote accuracy from 100% → 96.7% is the sign that the user
+flagged in the task brief as a "red flag."
+
+The **bottom line for production agentic workloads** is unchanged:
+prefix caching is the right configuration, even at high
+concurrency. EAGLE-3 ≈ PC on throughput at scale but loses on
+accuracy.
+
 **Variance band of the prefix-caching configuration** (95% / 91.7%
 across two runs ≈ ±3pp accuracy and ±9s wall time): every EAGLE-3
 metric is **outside the worst PC run** on the unfavorable side. The
