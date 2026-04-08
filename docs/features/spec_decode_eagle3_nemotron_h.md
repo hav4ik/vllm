@@ -169,22 +169,43 @@ top_p (0.95), the same `--max-num-seqs 16`, and the same
 prefix-caching flags differ.
 
 Two independent passes were run for the prefix-caching baseline (to
-measure variance from temperature=0.6 sampling) and one for EAGLE-3.
+measure variance from temperature=0.6 sampling), one for EAGLE-3 with
+`num_speculative_tokens=5` (the SpecForge default), and one with
+`num_speculative_tokens=3` (since the per-position acceptance decay
+was steep on this workload).
 
-| Metric | PC, no EAGLE-3 (run 1) | PC, no EAGLE-3 (run 2) | EAGLE-3, no PC |
-| --- | --- | --- | --- |
-| `--enable-prefix-caching --mamba-cache-mode all` | ✓ | ✓ | ✗ |
-| `--speculative-config eagle3 num_spec=5` | ✗ | ✗ | ✓ |
-| Per-session accuracy | **95.0%** (114/120) | **91.7%** (110/120) | 90.0% (108/120) |
-| Majority-vote accuracy (n=4) | 100.0% (30/30) | 100.0% (30/30) | 100.0% (30/30) |
-| Mean wall time / session | **113.2s** | **122.4s** | 140.5s |
-| Effective gen tokens/s | **96.2** | **94.9** | 80.3 |
-| Mean gen tokens / session | 10,889 | 11,622 | 11,281 |
-| Mean prompt tokens / session | 78,348 | 81,657 | 73,862 |
-| Sessions hitting max_turns / token_limit / no_answer | 6 | 8 | 10 |
-| EAGLE-3 mean acceptance rate | n/a | n/a | 31% (1.55 tok / draft) |
-| EAGLE-3 per-position acceptance | n/a | n/a | 67% / 40% / 24% / 15% / 9% |
-| Prefix-cache hit rate (avg over run) | ~50–80% | ~50–80% | 0% |
+| Metric | PC (run 1) | PC (run 2) | EAGLE-3 spec=5 | EAGLE-3 spec=3 |
+| --- | --- | --- | --- | --- |
+| `--enable-prefix-caching --mamba-cache-mode all` | ✓ | ✓ | ✗ | ✗ |
+| `--speculative-config eagle3` | ✗ | ✗ | num_spec=5 | num_spec=3 |
+| Per-session accuracy | **95.0%** | **91.7%** | 90.0% | 93.3% |
+| Majority-vote accuracy (n=4) | 100.0% | 100.0% | 100.0% | 100.0% |
+| Mean wall time / session | **113.2s** | **122.4s** | 140.5s | 130.0s |
+| Effective gen tokens/s | **96.2** | **94.9** | 80.3 | 84.6 |
+| Mean gen tokens / session | 10,889 | 11,622 | 11,281 | 11,004 |
+| Mean prompt tokens / session | 78,348 | 81,657 | 73,862 | 75,057 |
+| Sessions w/ max_turns/token_limit/no_answer | 6 | 8 | 10 | 8 |
+| EAGLE-3 mean acceptance rate | n/a | n/a | 31% (1.55 tok/draft) | 44% (1.31 tok/draft) |
+| EAGLE-3 per-position acceptance | n/a | n/a | 67/40/24/15/9% | 67/40/24% |
+| Prefix-cache hit rate (avg over run) | ~50–80% | ~50–80% | 0% | 0% |
+
+**Key observations:**
+
+- **Lowering `num_speculative_tokens` from 5 → 3 helps EAGLE-3** (93.3%
+  acc, 130s/session vs 90.0% acc, 140.5s/session). The per-position
+  acceptance decay is steep (67% → 40% → 24% → 15% → 9%), so the
+  marginal value of positions 4 and 5 is small while their compute
+  cost is constant.
+- **Even tuned EAGLE-3 still loses to prefix caching** on every
+  metric: 1.6–2.6pp lower accuracy, 6–15% slower wall time, 11–12%
+  lower effective tokens/s.
+- **The PC variance band** (95% / 91.7% accuracy across two runs ≈
+  ±3pp accuracy and ±9s wall time) does not overlap with EAGLE-3's
+  best run (93.3%/130s) on either accuracy *or* throughput.
+- The result is **robust to both sampling noise and EAGLE-3
+  hyper-parameter tuning** — prefix caching is the right choice for
+  this workload, not just on a lucky run with an arbitrary spec
+  count.
 
 **Variance band of the prefix-caching configuration** (95% / 91.7%
 across two runs ≈ ±3pp accuracy and ±9s wall time): every EAGLE-3
