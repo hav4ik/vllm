@@ -182,6 +182,12 @@ hidden-state mixture.
   rollback path. Verified empirically with `[5, 19, 33]` on
   2026-04-08 — same crash.
 
+  **For the full investigation log, the SGLang reference solution, the
+  recommended upstream fix path, and the complete table of every
+  configuration tried, see**
+  [`_pc_spec_decode_mamba_investigation.md`](_pc_spec_decode_mamba_investigation.md)
+  in this directory.
+
   The empirical workaround is to **pick one of**:
 
   - **Run with prefix caching, no EAGLE-3.** Drop the `--speculative-config`
