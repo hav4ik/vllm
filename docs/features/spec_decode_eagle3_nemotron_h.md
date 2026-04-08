@@ -198,13 +198,25 @@ Per-config means with both runs collapsed:
 | EAGLE-3 spec=5, no PC (n=1) | 90.0% | 140.5s | 80.3 |
 | **PC vs Eagle3 spec=3 advantage** | **+0.5pp** | **−13% wall** | **+12% t/s** |
 
-**Key observations:**
+**`num_speculative_tokens` sweep** (all at seqs=16):
 
-- **Lowering `num_speculative_tokens` from 5 → 3 helps EAGLE-3** (93%
-  acc, 133s/session vs 90% acc, 140s/session). The per-position
-  acceptance decay is steep (67/40/24/15/9%), so positions 4-5 add
-  ~24% combined acceptance for full compute cost — net negative on
-  this workload.
+| spec count | per_session_acc | mean_wall_s | eff_gen_t/s |
+| --- | --- | --- | --- |
+| 2 | 90.0% | 136.4s | 82.3 |
+| **3** (sweet spot) | **92.9%** (mean of 2 runs) | **133.2s** | **85.1** |
+| 5 (SpecForge default) | 90.0% | 140.5s | 80.3 |
+
+**`num_speculative_tokens=3` is the sweet spot** for this workload —
+both faster *and* more accurate than spec=2 and spec=5. The accuracy
+drop at spec=2 (90.0%) suggests position 2 is still contributing
+useful tokens, while the wall-time bump from spec=3→5 (133→140s)
+without an accuracy gain confirms positions 4–5 are net-negative
+(67/40/24/15/9% per-position decay → 1.55 vs 1.31 mean accepted per
+draft, but positions 4-5 cost full compute for ~24% combined
+acceptance).
+
+**Key observations (vs PC):**
+
 - **PC still wins on the metrics that matter for agentic loops.**
   After multi-run averaging, accuracy is essentially tied with
   EAGLE-3 spec=3 (PC 93.4% vs EAGLE-3 92.9% — within sampling
