@@ -156,8 +156,109 @@ hidden-state mixture.
     and `--mamba-cache-mode`. Best for single-turn, short-context
     workloads where per-token decode latency dominates.
 
-  See the next section for an empirical comparison of the two on the
-  AIME-25 dataset (mathematical reasoning, multi-turn tool use).
+  See "Empirical comparison" below for the actual numbers from running
+  both on AIME-25 (mathematical reasoning with sandbox tool use, 4
+  sessions per problem, 30 problems = 120 sessions).
+
+### Empirical comparison: PC vs EAGLE-3 on AIME-25
+
+Both runs use the same vLLM tip-of-main install, the same
+`chankhavu/c2-softcpy-fp8` verifier, the same temperature (0.6) and
+top_p (0.95), the same `--max-num-seqs 16`, and the same
+`max_completion_tokens=32768`. Only the speculative-config and
+prefix-caching flags differ.
+
+| Metric | PC, no EAGLE-3 | EAGLE-3, no PC |
+| --- | --- | --- |
+| `--enable-prefix-caching --mamba-cache-mode all` | ✓ | ✗ |
+| `--speculative-config eagle3 num_spec=5` | ✗ | ✓ |
+| Per-session accuracy | **95.0%** (114/120) | 90.0% (108/120) |
+| Majority-vote accuracy (n=4) | 100.0% (30/30) | 100.0% (30/30) |
+| Mean wall time / session | **113.2s** | 140.5s (+24%) |
+| Effective gen tokens/s | **96.2** | 80.3 (-17%) |
+| Mean gen tokens / session | 10,889 | 11,281 |
+| Mean prompt tokens / session | 78,348 | 73,862 |
+| Sessions hitting max_turns / token_limit / no_answer | 6 | 10 |
+| EAGLE-3 mean acceptance rate | n/a | 31% (1.55 tok / draft) |
+| EAGLE-3 per-position acceptance | n/a | 67% / 40% / 24% / 15% / 9% |
+| Prefix-cache hit rate (avg over run) | ~50–80% | 0% |
+
+**Why prefix caching wins so decisively here:**
+
+* The AIME-style tool-use loop sends the *full* conversation history
+  (system prompt + every previous assistant turn + every tool result)
+  to the model on every turn. Mean prompt tokens per session is ~78k,
+  vs ~11k generated tokens — i.e. **prefill is 7x larger than decode
+  by token count**. Anything that speeds up only decode is fighting
+  the wrong fight on this workload.
+* With prefix caching, the recurring prefix is served from the
+  attention KV + mamba state cache; observed prefix-cache hit rate
+  was ~50–80% across the run (and the mamba SSM state was correctly
+  cached, which is the headline win of vLLM's PR #34874 / #33726
+  pair).
+* EAGLE-3 *is* doing real work — 31% mean acceptance rate, declining
+  cleanly across positions 0-4, ~1.55 tokens accepted per draft of 5 —
+  but that ~1.5x decode speedup doesn't compensate for the 7x prefill
+  overhead.
+
+**When EAGLE-3 *would* win:** workloads dominated by per-token decode
+latency rather than prefill — e.g., single-turn short-prompt chat,
+streaming completions where the prefill is cheap, or batch generation
+of long completions from short novel prompts. None of those describe
+agentic / multi-turn / long-context retrieval workflows.
+
+**The ideal would be both at once.** Once the upstream bug pair above
+is fixed, the same docs will be updated with a third row for
+"`PC + EAGLE-3`" — that should beat either configuration alone, since
+prefix caching handles the prefill cost while EAGLE-3 cuts decode
+latency.
+
+### Reproducing the comparison
+
+The benchmark scripts and trace dirs are in this branch's parent
+workspace, not in `vllm/` itself. The key commands are:
+
+```bash
+# Run 1: prefix caching, no EAGLE-3 (the agentic-friendly baseline)
+VLLM_USE_FLASHINFER_MOE_FP8=1 vllm serve chankhavu/c2-softcpy-fp8 \
+    --max-model-len 65536 --trust-remote-code \
+    --mamba-ssm-cache-dtype float32 --max-num-seqs 16 \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching --mamba-cache-mode all --mamba-block-size 512 \
+    --enable-chunked-prefill --max-num-batched-tokens 8192 \
+    --async-scheduling --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+    --download-dir /workspace/models --host 127.0.0.1 --port 18000
+
+python collect_traces_nemotron.py \
+    --input_dir data/ --output_dir traces/baseline_pc/ \
+    --n_sessions 4 --max_parallel 8 \
+    --server_addr 127.0.0.1:18000 \
+    --model_name chankhavu/c2-softcpy-fp8 \
+    --max_tokens 32768 --max_turns 32 \
+    --temperature 0.6 --top_p 0.95 --resume
+
+python calc_accuracy.py traces/baseline_pc/
+
+# Run 2: EAGLE-3, no prefix caching
+VLLM_USE_FLASHINFER_MOE_FP8=1 vllm serve chankhavu/c2-softcpy-fp8 \
+    --max-model-len 65536 --trust-remote-code \
+    --mamba-ssm-cache-dtype float32 --max-num-seqs 16 \
+    --kv-cache-dtype fp8 \
+    --enable-chunked-prefill --max-num-batched-tokens 8192 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+    --download-dir /workspace/models --host 127.0.0.1 --port 18000 \
+    --speculative-config '{"model":"chankhavu/c2.eagle3-test","method":"eagle3","num_speculative_tokens":5}'
+
+python collect_traces_nemotron.py \
+    --input_dir data/ --output_dir traces/eagle3_no_pc/ \
+    --n_sessions 4 --max_parallel 8 \
+    --server_addr 127.0.0.1:18000 \
+    --model_name chankhavu/c2-softcpy-fp8 \
+    --max_tokens 32768 --max_turns 32 \
+    --temperature 0.6 --top_p 0.95 --resume
+
+python calc_accuracy.py traces/eagle3_no_pc/
+```
 
 ### Sanity check
 
