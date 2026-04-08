@@ -1,0 +1,97 @@
+--- /tmp/sglang_orig/extracted/sglang/srt/models/nemotron_h.py	2026-04-08 20:29:41.463733767 +0000
++++ /workspace/vllm_nemotron3_eagle3/sglangenv/lib/python3.12/site-packages/sglang/srt/models/nemotron_h.py	2026-04-08 20:29:17.160979730 +0000
+@@ -605,6 +605,16 @@
+         else:
+             self.norm_f = PPMissingLayer(return_tuple=True)
+ 
++        # PATCHED 2026-04-08: Eagle3 aux hidden state layer capture support.
++        # Mirrors the qwen2 / llama / etc. pattern -- captures the residual
++        # stream BEFORE each layer in `layers_to_capture`. SGLang's convention
++        # uses "input to layer k", so a SpecForge-trained config of
++        # `eagle_aux_hidden_state_layer_ids = [2, 26, 48]` (which means
++        # "output of layers 2/26/48") becomes `[3, 27, 49]` here -- the
++        # +1 conversion is done in `set_eagle3_layers_to_capture` on the
++        # ForCausalLM class.
++        self.layers_to_capture: list[int] = []
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+@@ -624,7 +634,12 @@
+             hidden_states = pp_proxy_tensors["hidden_states"]
+             residual = pp_proxy_tensors["residual"]
+ 
++        aux_hidden_states: list[torch.Tensor] = []
+         for i in range(self.start_layer, self.end_layer):
++            if i in self.layers_to_capture:
++                aux_hidden_states.append(
++                    hidden_states + residual if residual is not None else hidden_states
++                )
+             layer = self.layers[i]
+             if not isinstance(layer, Layers):
+                 raise ValueError(f"Unknown layer type: {type(layer)}")
+@@ -639,6 +654,8 @@
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+         hidden_states, _ = self.norm_f(hidden_states, residual)
++        if len(aux_hidden_states) > 0:
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+ 
+@@ -721,6 +738,9 @@
+                 self.lm_head.weight.copy_(emb_token_weight)
+ 
+         self.logits_processor = LogitsProcessor(config)
++        # PATCHED 2026-04-08: Eagle3 capture flag, set by
++        # set_eagle3_layers_to_capture below.
++        self.capture_aux_hidden_states = False
+ 
+     def _init_model(
+         self,
+@@ -747,13 +767,44 @@
+         hidden_states = self.model.forward(
+             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
+         )
++        # PATCHED 2026-04-08: Eagle3 aux hidden state propagation. When
++        # spec decode is active, NemotronHModel.forward returns a tuple
++        # (hidden_states, aux_hidden_states). Unpack and pass aux through
++        # to the logits processor like qwen2 / llama do.
++        aux_hidden_states = None
++        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
++            hidden_states, aux_hidden_states = hidden_states
+         if self.pp_group.is_last_rank:
+             return self.logits_processor(
+-                input_ids, hidden_states, self.lm_head, forward_batch
++                input_ids,
++                hidden_states,
++                self.lm_head,
++                forward_batch,
++                aux_hidden_states=aux_hidden_states,
+             )
+         else:
+             return hidden_states
+ 
++    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
++        # PATCHED 2026-04-08: Eagle3 layer capture installer, mirroring the
++        # qwen2 implementation. Convention: SpecForge stores the trained
++        # `eagle_aux_hidden_state_layer_ids` as "output of layer k", but
++        # SGLang's capture loop fires BEFORE running each layer, so a
++        # value of `k` here means "input to layer k = output of layer k-1".
++        # The +1 conversion below makes them agree.
++        if not self.pp_group.is_last_rank:
++            return
++        self.capture_aux_hidden_states = True
++        if layer_ids is None:
++            num_layers = len(self.config.hybrid_override_pattern)
++            self.model.layers_to_capture = [
++                2,
++                num_layers // 2,
++                num_layers - 3,
++            ]
++        else:
++            self.model.layers_to_capture = [val + 1 for val in layer_ids]
++
+     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
+         return self.mamba_cache.copy_inputs_before_cuda_graphs(input_buffers, **kwargs)
+ 
