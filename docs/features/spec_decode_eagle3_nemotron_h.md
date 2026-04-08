@@ -113,41 +113,76 @@ hidden-state mixture.
   Cascade-2 SGLang vs. vLLM gap of 88.3% → 99.17% on AIME 2025 was
   caused by exactly this).
 
-* **EAGLE-3 + mamba prefix caching is *not* a single bug.** As of
-  2026-04-08, combining `--mamba-cache-mode all` + `--enable-prefix-caching`
-  + EAGLE-3 spec decode hits two distinct bugs in the verifier-side
-  attention stack:
+* **EAGLE-3 + mamba prefix caching is fundamentally a mamba-state
+  rollback bug**, not an EAGLE-3 bug. Spec decoding requires the
+  verifier to compute "speculative" state updates for `1 +
+  num_spec_tokens` tokens per request, then **roll back** the rejected
+  speculative state on rejection. With mamba prefix caching enabled,
+  there are multiple cache slots per request and the rollback has to
+  decide which slot to commit, which to discard. The vLLM mamba layer
+  doesn't correctly implement this rollback semantics on top of prefix
+  caching. The chain of bugs is at least three deep:
 
-  1. **Mamba attention CUDA-graph capture buffer mismatch**
-     (`vllm/v1/attention/backends/mamba_attn.py`). When spec decode +
-     mamba_cache_mode=all are both active, the preallocated
-     `state_indices_tensor_d` is sized for `(max_num_seqs, max_num_blocks)`
-     but the runtime metadata is sized for `(max_num_seqs, max_num_blocks
-     + spec_padding)`. The code comment in the buffer-allocation block
+  1. **`vllm/v1/attention/backends/mamba_attn.py:117` —
+     `state_indices_tensor_d` cudagraph capture buffer mismatch.**
+     When spec decode + mamba_cache_mode=all are both active, the
+     preallocated buffer is sized for `(max_num_seqs, max_num_blocks)`
+     but the runtime metadata can be `(max_num_seqs, max_num_blocks +
+     num_spec_tokens)`. The code comment in the buffer allocation
      literally says *"Speculative decoding not supported with prefix
-     caching, so keep shape consistent with prefill buffer"*. This bug
-     was **partially fixed** between vLLM 0.19.0 and tip-of-main (Mar
-     2026) by PRs #34874, #33726 and #35447, but only when the FlashInfer
-     attention backend forces a downgrade to `cudagraph_mode=PIECEWISE`.
-     With the Triton attention backend (which keeps
-     `FULL_AND_PIECEWISE`), the same buffer mismatch still triggers at
-     init time on tip-of-main.
+     caching, so keep shape consistent with prefill buffer"*. Partial
+     fix is in `_partial_mamba_attn_fix.patch` next to this doc — it
+     widens the buffer by `num_spec_tokens` and slices `block_idx_last_*`
+     to `num_reqs` instead of `num_decode_tokens`. The patch unblocks
+     init but exposes the next bug.
 
-  2. **FlashInfer FP8 paged-KV prefill kernel illegal memory access**
-     when called with a partial prefix (i.e. with prefix caching active)
-     AND a spec-decode-inflated batch. Reproduces against
-     `flashinfer-python` 0.6.7 with `kv_cache_dtype=fp8_e4m3`,
-     `block_size=4288`, NemotronH MoE+Mamba. Independent of vLLM
-     version (still hits on vLLM tip-of-main as of 2026-04-08). The
-     crash signature is `BatchPrefillWithPagedKVCacheRun failed with
-     error an illegal memory access was encountered` from the
-     `batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_e4m3...` kernel.
-     Triggers on the *first decode* after a request with cached prefix
-     even with `--enforce-eager` (so it is not a CUDA-graph artifact).
+  2. **`vllm/model_executor/layers/mamba/mamba_mixer2.py:632`
+     `torch.split(block_idx_last_*, [num_decodes, num_prefills])`
+     length mismatch.** The downstream consumer of the mamba metadata
+     splits the block-idx tensor by request count
+     (`num_decodes + num_prefills`), but `mamba_attn.py` was slicing
+     it to `num_decode_tokens` (the spec-inflated count). Patched in
+     the same partial fix.
 
-  Either bug alone blocks `EAGLE-3 + prefix caching` for NemotronH on
-  vLLM 0.19.0; both must be resolved upstream before the combination
-  can ship. The empirical workaround is to **pick one of**:
+  3. **`vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+     _selective_scan_update_kernel` illegal memory access at runtime.**
+     The mamba SSM Triton kernel itself doesn't correctly handle the
+     `state_batch_indices` / `dst_state_batch_indices` /
+     `num_accepted_tokens` / `cu_seqlens` combination when prefix
+     caching is on AND there are speculative tokens to roll back per
+     request. This is the actual rollback semantics bug — the kernel
+     does not know how to commit "accepted prefix, rollback rejected
+     suffix" when each sequence has multiple cache slots. **No
+     patch — needs upstream vLLM fix in the mamba SSM kernel.**
+
+  In addition, with the FP8 verifier `chankhavu/c2-softcpy-fp8`, vLLM
+  picks the FlashInfer FP8 paged prefill kernel which has a related
+  but distinct bug (`BatchPrefillWithPagedKVCacheRun` illegal memory
+  access on first decode after a partial-prefix prefill with
+  spec-decode-inflated batch). Switching to the BF16 verifier
+  `nvidia/Nemotron-Cascade-2-30B-A3B` bypasses this kernel (vLLM
+  picks `FLASH_ATTN` instead of `FLASHINFER`) but exposes bugs 1-3
+  above.
+
+  **Crucially, this entire bug chain is independent of the
+  speculative-decoding *method*.** The bugs live in the verifier-side
+  mamba state path. Eagle3, MTP, and the n-gram prompt-lookup
+  speculator all hit the same illegal memory accesses (verified
+  empirically with all three on the BF16 verifier on 2026-04-08). The
+  draft model only generates speculative tokens; the actual rollback
+  is the verifier's mamba layers' responsibility, and that's what's
+  broken. Switching to MTP would not fix this.
+
+  Likewise, **changing which layers EAGLE-3 attaches to does not
+  help.** The aux-hidden-state layer choice (`[2, 26, 48]` vs
+  `[5, 19, 33]` all-attention vs anything else) only controls which
+  layer outputs the draft head reads — it does not change what the
+  verifier computes. The verifier still runs all 52 layers including
+  the 23 mamba layers, which still go through the buggy state
+  rollback path. Verified empirically with `[5, 19, 33]` on
+  2026-04-08 — same crash.
+
+  The empirical workaround is to **pick one of**:
 
   - **Run with prefix caching, no EAGLE-3.** Drop the `--speculative-config`
     flag. Best for agentic / multi-turn workloads where the long shared
