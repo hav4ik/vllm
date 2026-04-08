@@ -113,20 +113,51 @@ hidden-state mixture.
   Cascade-2 SGLang vs. vLLM gap of 88.3% → 99.17% on AIME 2025 was
   caused by exactly this).
 
-* **Mamba prefix caching (`--mamba-cache-mode all`) is currently
-  incompatible with EAGLE-3 spec decode** in vLLM 0.19. Combining
-  `--mamba-cache-mode all` + `--enable-prefix-caching` +
-  `--async-scheduling` + `--speculative-config eagle3` triggers a
-  CUDA illegal memory access at first decode. Drop `--mamba-cache-mode`
-  and `--enable-prefix-caching` if you want to use EAGLE-3.
-  Investigation tracked separately; this is not a fundamental
-  blocker — full prefix caching just needs to be plumbed through the
-  hybrid drafter path. If you do not need prefix caching, the command
-  above runs end-to-end with full CUDA graph capture.
+* **EAGLE-3 + mamba prefix caching is *not* a single bug.** As of
+  2026-04-08, combining `--mamba-cache-mode all` + `--enable-prefix-caching`
+  + EAGLE-3 spec decode hits two distinct bugs in the verifier-side
+  attention stack:
 
-* **`--async-scheduling`** also appears to be on the same incompatibility
-  axis when combined with mamba prefix caching. Without mamba prefix
-  caching, `--async-scheduling` is fine.
+  1. **Mamba attention CUDA-graph capture buffer mismatch**
+     (`vllm/v1/attention/backends/mamba_attn.py`). When spec decode +
+     mamba_cache_mode=all are both active, the preallocated
+     `state_indices_tensor_d` is sized for `(max_num_seqs, max_num_blocks)`
+     but the runtime metadata is sized for `(max_num_seqs, max_num_blocks
+     + spec_padding)`. The code comment in the buffer-allocation block
+     literally says *"Speculative decoding not supported with prefix
+     caching, so keep shape consistent with prefill buffer"*. This bug
+     was **partially fixed** between vLLM 0.19.0 and tip-of-main (Mar
+     2026) by PRs #34874, #33726 and #35447, but only when the FlashInfer
+     attention backend forces a downgrade to `cudagraph_mode=PIECEWISE`.
+     With the Triton attention backend (which keeps
+     `FULL_AND_PIECEWISE`), the same buffer mismatch still triggers at
+     init time on tip-of-main.
+
+  2. **FlashInfer FP8 paged-KV prefill kernel illegal memory access**
+     when called with a partial prefix (i.e. with prefix caching active)
+     AND a spec-decode-inflated batch. Reproduces against
+     `flashinfer-python` 0.6.7 with `kv_cache_dtype=fp8_e4m3`,
+     `block_size=4288`, NemotronH MoE+Mamba. Independent of vLLM
+     version (still hits on vLLM tip-of-main as of 2026-04-08). The
+     crash signature is `BatchPrefillWithPagedKVCacheRun failed with
+     error an illegal memory access was encountered` from the
+     `batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_e4m3...` kernel.
+     Triggers on the *first decode* after a request with cached prefix
+     even with `--enforce-eager` (so it is not a CUDA-graph artifact).
+
+  Either bug alone blocks `EAGLE-3 + prefix caching` for NemotronH on
+  vLLM 0.19.0; both must be resolved upstream before the combination
+  can ship. The empirical workaround is to **pick one of**:
+
+  - **Run with prefix caching, no EAGLE-3.** Drop the `--speculative-config`
+    flag. Best for agentic / multi-turn workloads where the long shared
+    prefix dominates.
+  - **Run with EAGLE-3, no prefix caching.** Drop `--enable-prefix-caching`
+    and `--mamba-cache-mode`. Best for single-turn, short-context
+    workloads where per-token decode latency dominates.
+
+  See the next section for an empirical comparison of the two on the
+  AIME-25 dataset (mathematical reasoning, multi-turn tool use).
 
 ### Sanity check
 
