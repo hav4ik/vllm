@@ -4904,6 +4904,12 @@ class GPUModelRunner(
 
         layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
         if not layer_ids:
+            # SpecForge stores the layer ids nested under `eagle_config`
+            # (a dict on the draft hf_config). Support both layouts.
+            eagle_config = getattr(hf_config, "eagle_config", None)
+            if isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+        if not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
             if dflash_config and isinstance(dflash_config, dict):
                 layer_ids = dflash_config.get("target_layer_ids")
