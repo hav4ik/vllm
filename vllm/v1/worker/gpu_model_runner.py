@@ -1461,36 +1461,23 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
-            # v2 PC+spec: commit boundary states to pool.
-            # For each mamba layer, check if any request crossed a block
-            # boundary in this step. If so, copy the boundary-position
-            # state from scratch to the pool's block slot.
-            if (
-                self.speculative_config is not None
-                and self.cache_config.mamba_cache_mode == "all"
-            ):
+            # PC + spec: commit boundary states from spec slots → pool
+            if (self.speculative_config is not None
+                and self.cache_config.mamba_cache_mode == "all"):
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-                    MambaMixer2,
-                )
+                    MambaMixer2)
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
-                # num_computed_tokens BEFORE this step (= n_done per req)
                 num_computed_gpu = (
                     self.input_batch.num_computed_tokens_cpu_tensor[
-                        :num_reqs
-                    ].to(self.device)
-                )
-                block_size = self.cache_config.mamba_block_size
+                        :num_reqs].to(self.device))
+                bs = self.cache_config.mamba_block_size
                 for layer in (
                     self.compilation_config.static_forward_context.values()
                 ):
                     if isinstance(layer, MambaMixer2) and getattr(
-                        layer, "_pc_spec_v2_enabled", False
-                    ):
+                        layer, "_pc_spec_enabled", False):
                         layer.commit_boundary_states(
-                            num_accepted_gpu,
-                            num_computed_gpu,
-                            block_size,
-                        )
+                            num_accepted_gpu, num_computed_gpu, bs)
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -6809,19 +6796,13 @@ class GPUModelRunner(
             num_attn_module,
         )
 
-        # v2 PC+spec: eagerly init scratch SSM tensors for all MambaMixer2
-        # layers AFTER bind_kv_cache (so kv_cache[1] = ssm_state exists).
-        from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-            MambaMixer2,
-        )
+        # Init spec slots for PC + spec decode
+        from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
         for layer in self.compilation_config.static_forward_context.values():
-            if (
-                isinstance(layer, MambaMixer2)
-                and getattr(layer, "_pc_spec_v2_enabled", False)
-                and layer.spec_scratch_ssm_state is None
-            ):
-                ssm_state = layer.kv_cache[1]
-                layer._init_pc_spec_v2_scratch(ssm_state)
+            if (isinstance(layer, MambaMixer2)
+                and getattr(layer, "_pc_spec_enabled", False)
+                and layer.spec_ssm is None):
+                layer.init_spec_slots(layer.kv_cache[0], layer.kv_cache[1])
 
         return kv_caches
 
