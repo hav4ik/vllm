@@ -860,33 +860,28 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 spec_ids = self._spec_slot_ids[:num_decodes]
                 base_long = self._spec_base_long[:num_decodes]
 
-                # Init: pool → spec[base+0] (first step after prefill).
-                # Then promote: spec[base+N_prev-1] → spec[base+0]
-                # (overwrites stale pool data with correct accepted state).
-                canonical = state_indices_tensor_d.gather(
-                    1, block_idx_last_computed_token_d.unsqueeze(1)
-                ).squeeze(1).long()
-
-                # SSM init + promote
-                self.spec_ssm.index_copy_(
-                    0, base_long,
-                    ssm_state.index_select(0, canonical))
-                n_prev = num_accepted_tokens[:num_decodes].long().clamp(min=1)
-                prev_slot = base_long + n_prev - 1
-                self.spec_ssm.index_copy_(
-                    0, base_long,
-                    self.spec_ssm.index_select(0, prev_slot))
-
-                # Conv init + promote (with layout transpose)
-                spec_conv_view = (
-                    self.spec_conv if is_conv_state_dim_first()
-                    else self.spec_conv.transpose(-1, -2))
-                spec_conv_view.index_copy_(
-                    0, base_long,
-                    conv_state.index_select(0, canonical))
-                spec_conv_view.index_copy_(
-                    0, base_long,
-                    spec_conv_view.index_select(0, prev_slot))
+                # Init spec slots from pool ONCE per request (first
+                # decode step after prefill). Detected via _spec_inited
+                # flag per batch position.
+                needs_init = ~self._spec_inited[:num_decodes]
+                if needs_init.any():
+                    init_idx = needs_init.nonzero(as_tuple=True)[0]
+                    canonical = state_indices_tensor_d.gather(
+                        1, block_idx_last_computed_token_d.unsqueeze(1)
+                    ).squeeze(1).long()
+                    init_bases = base_long[init_idx]
+                    init_canon = canonical[init_idx]
+                    # SSM
+                    self.spec_ssm.index_copy_(
+                        0, init_bases,
+                        ssm_state.index_select(0, init_canon))
+                    # Conv
+                    spec_cv = (self.spec_conv if is_conv_state_dim_first()
+                               else self.spec_conv.transpose(-1, -2))
+                    spec_cv.index_copy_(
+                        0, init_bases,
+                        conv_state.index_select(0, init_canon))
+                    self._spec_inited[init_idx] = True
 
                 # SSM kernel uses spec slots
                 state_indices_tensor_d_input = spec_ids
@@ -1015,6 +1010,30 @@ class MambaMixer2(MambaBase, PluggableLayer):
         offsets = torch.arange(K1, device=device, dtype=torch.int32)
         self._spec_slot_ids = (bases.unsqueeze(1) + offsets.unsqueeze(0)).contiguous()
         self._spec_base_long = bases.long().contiguous()
+        # Per-batch-position flag: True if spec slots have been
+        # initialized from the pool. Reset when request leaves.
+        self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
+
+    def init_spec_from_pool(self, req_indices: torch.Tensor,
+                            canonical_slots: torch.Tensor):
+        """One-time init: copy pool state → spec[base+0] for new requests.
+        Called from gpu_model_runner when requests transition prefill→decode."""
+        if self.spec_ssm is None:
+            return
+        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+        base = self._spec_base_long[req_indices]
+        # SSM
+        self.spec_ssm.index_copy_(
+            0, base,
+            self.kv_cache[1].index_select(0, canonical_slots.long()))
+        # Conv (with layout)
+        spec_cv = (self.spec_conv if is_conv_state_dim_first()
+                   else self.spec_conv.transpose(-1, -2))
+        pool_cv = (self.kv_cache[0] if is_conv_state_dim_first()
+                   else self.kv_cache[0].transpose(-1, -2))
+        spec_cv.index_copy_(
+            0, base,
+            pool_cv.index_select(0, canonical_slots.long()))
 
     def commit_boundary_states(self, num_accepted: torch.Tensor,
                                 num_computed: torch.Tensor, block_size: int):
