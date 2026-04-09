@@ -1,0 +1,108 @@
+diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
+index eec530322..667a75241 100644
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -111,13 +111,24 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+                 self.vllm_config.model_config.max_model_len,
+                 self.kv_cache_spec.block_size,
+             )
+-            # Speculative decoding not supported with prefix caching,
+-            # so keep shape consistent with prefill buffer
+-            # TODO: reduce this size as needed for decode-only cudagraph capture
++            # Reserve extra block-table slots when speculative decoding is
++            # active so the per-call `state_indices_tensor_d` (which can be up
++            # to `num_spec_tokens` blocks longer than the no-spec case)
++            # always fits into this preallocated buffer. Without this margin
++            # the `_update_metadata_for_cudagraph_capture` copy on line ~503
++            # raises a shape mismatch (e.g. "tensor a (26) must match tensor
++            # b (29) at non-singleton dimension 1") at engine init when both
++            # spec decode and mamba prefix caching are enabled. The original
++            # comment here used to claim "Speculative decoding not supported
++            # with prefix caching" -- this fix lifts that restriction for
++            # NemotronH-style hybrid models.
++            spec_block_margin = (
++                self.num_spec_tokens if self.num_spec_tokens > 0 else 0
++            )
+             self.state_indices_tensor_d: torch.Tensor = torch.empty(
+                 (
+                     self.decode_cudagraph_max_bs,
+-                    max_num_blocks,
++                    max_num_blocks + spec_block_margin,
+                 ),
+                 dtype=torch.int32,
+                 device=device,
+@@ -500,10 +511,40 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+         ):
+             padded_bs = metadata.num_reqs
+-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
++            # In `mamba_cache_mode == "all"` mode the per-call state_indices
++            # tensor is 2-D `(num_decodes, blocks_per_req)`. With spec decode
++            # active, `blocks_per_req` can grow by up to `num_spec_tokens`
++            # because the runner pre-reserves spec verification slots in the
++            # block table. We slice the persistent buffer's dim 1 to match the
++            # per-call width so the copy works as long as the buffer is at
++            # least that wide (we ensure this by adding `num_spec_tokens` to
++            # `max_num_blocks` at allocation time -- see __init__).
++            per_call_blocks_dim = (
++                state_indices_tensor_d.shape[1]
++                if state_indices_tensor_d.dim() > 1
++                else 1
++            )
++            buf_blocks_dim = (
++                self.state_indices_tensor_d.shape[1]
++                if self.state_indices_tensor_d.dim() > 1
++                else 1
++            )
++            assert per_call_blocks_dim <= buf_blocks_dim, (
++                f"mamba state_indices_tensor_d width {per_call_blocks_dim} "
++                f"exceeds preallocated buffer width {buf_blocks_dim}; "
++                f"increase the spec_block_margin in __init__ "
++                f"(num_spec_tokens={self.num_spec_tokens})."
++            )
++            if self.state_indices_tensor_d.dim() > 1:
++                buffer_view = self.state_indices_tensor_d[
++                    :, :per_call_blocks_dim
++                ]
++            else:
++                buffer_view = self.state_indices_tensor_d
++            buffer_view[: metadata.num_decodes].copy_(
+                 state_indices_tensor_d, non_blocking=True
+             )
+-            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
++            state_indices_tensor_d = buffer_view[:padded_bs]
+             state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+ 
+             if self.use_spec_decode and num_accepted_tokens is not None:
+@@ -520,12 +561,21 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+             if self.vllm_config.cache_config.mamba_cache_mode == "all":
+                 assert block_idx_last_scheduled_token is not None
+                 assert block_idx_last_computed_token is not None
++                # NOTE: with spec decode active `num_decode_tokens` can be
++                # larger than `num_decodes` (each decode request expands to
++                # 1 + num_spec_tokens tokens). The downstream consumer in
++                # `mamba_mixer2.conv_ssm_forward` then does
++                # `torch.split(block_idx_last_*, [num_decodes, num_prefills])`
++                # which expects the tensor length to equal `num_decodes +
++                # num_prefills` (= num_reqs), not `num_decode_tokens`. We're
++                # inside the `num_prefills == 0` branch so just slice to
++                # `padded_bs` (= num_reqs in pure-decode batch).
+                 self.block_idx_last_scheduled_token[: metadata.num_decodes].copy_(
+                     block_idx_last_scheduled_token[: metadata.num_decodes],
+                     non_blocking=True,
+                 )
+                 block_idx_last_scheduled_token = self.block_idx_last_scheduled_token[
+-                    : metadata.num_decode_tokens
++                    :padded_bs
+                 ]
+ 
+                 self.block_idx_last_computed_token[: metadata.num_decodes].copy_(
+@@ -533,7 +583,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+                     non_blocking=True,
+                 )
+                 block_idx_last_computed_token = self.block_idx_last_computed_token[
+-                    : metadata.num_decode_tokens
++                    :padded_bs
+                 ]
+ 
+         return replace(

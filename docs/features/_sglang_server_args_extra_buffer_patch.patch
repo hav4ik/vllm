@@ -1,0 +1,18 @@
+--- /tmp/sglang_orig/extracted/sglang/srt/server_args.py	2026-04-08 20:29:41.321735202 +0000
++++ /workspace/vllm_nemotron3_eagle3/sglangenv/lib/python3.12/site-packages/sglang/srt/server_args.py	2026-04-08 20:20:20.465664520 +0000
+@@ -1939,10 +1939,14 @@
+                     self.quantization = model_config.quantization
+                 self.moe_runner_backend = "flashinfer_cutlass"
+ 
++            # PATCHED 2026-04-08: flip extra_buffer support to True for
++            # NemotronH to test if SGLang's cache-isolation kernels work
++            # for this model architecture. The upstream guard was a
++            # safety flag, not a hard kernel-level limit.
+             self._handle_mamba_radix_cache(
+                 model_arch=model_arch,
+                 support_mamba_cache=True,
+-                support_mamba_cache_extra_buffer=False,
++                support_mamba_cache_extra_buffer=True,
+                 sm100_default_attention_backend="flashinfer",
+             )
+             assert self.attention_backend != "triton", (
