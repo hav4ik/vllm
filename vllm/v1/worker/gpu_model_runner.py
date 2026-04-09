@@ -1521,8 +1521,8 @@ class GPUModelRunner(
                 # _spec_scratch_pending[0] is canonical_dst_slot_long_buf,
                 # whose first dim equals the number of decodes processed
                 # by this step. Use that as the slice length.
-                canonical_dst_long, _scratch_base = (
-                    first_mamba_layer._spec_scratch_pending
+                canonical_dst_long = (
+                    first_mamba_layer._spec_scratch_pending[0]
                 )
                 num_decodes_this_step = canonical_dst_long.shape[0]
                 # Slice both the unsafe mask buffer and the GPU
