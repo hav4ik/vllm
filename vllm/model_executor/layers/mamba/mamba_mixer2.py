@@ -1333,23 +1333,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # The conv_state in the regular pool has shape
         #   (num_blocks, conv_dim, state_len)
         # where state_len = conv_kernel - 1 + num_spec (widened for spec).
-        # We use the same stride[0] = page_size_elements / conv_dtype_size
-        # so that index_copy_ between scratch and the pool works.
+        #
+        # IMPORTANT: we use CONTIGUOUS allocation for conv scratch
+        # (NOT the page-padded stride used by the regular pool). The
+        # page padding is huge (~2.3MB/slot for NemotronH) because it's
+        # shared with the SSM state segment, but the conv data is only
+        # ~196KB/slot. Page-padded scratch would waste ~5.8GB across 31
+        # layers, causing OOM. Contiguous scratch is ~481MB total.
+        #
+        # PyTorch's index_copy_ / index_select handle the stride
+        # mismatch between page-padded pool and contiguous scratch
+        # correctly: they copy element-by-element, not raw bytes.
         # ===========================================================
         conv_per_slot_shape = conv_state.shape[1:]
-        conv_page_size_elements = conv_state.stride(0)
-        conv_inner_stride = torch.empty(conv_per_slot_shape).stride()
-        conv_target_stride = (conv_page_size_elements, *conv_inner_stride)
-        conv_raw = torch.zeros(
-            total_slots * conv_page_size_elements,
+        self.spec_scratch_conv_state = torch.zeros(
+            (total_slots, *conv_per_slot_shape),
             dtype=conv_state.dtype,
             device=conv_state.device,
-        )
-        self.spec_scratch_conv_state = torch.as_strided(
-            conv_raw,
-            size=(total_slots, *conv_per_slot_shape),
-            stride=conv_target_stride,
-            storage_offset=0,
         )
 
         # ===========================================================
