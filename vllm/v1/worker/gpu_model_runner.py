@@ -1069,6 +1069,24 @@ class GPUModelRunner(
         # then resubmitted with the same ID. In this case, we treat them as two
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
+        # Reset spec slot init flags for finished requests (so the
+        # batch position can be reused by a new request with fresh init).
+        if (self.speculative_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+            and scheduler_output.finished_req_ids):
+            from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+                MambaMixer2)
+            for req_id in scheduler_output.finished_req_ids:
+                batch_idx = self.input_batch.req_id_to_index.get(req_id)
+                if batch_idx is not None:
+                    for layer in (
+                        self.compilation_config.static_forward_context.values()
+                    ):
+                        if (isinstance(layer, MambaMixer2)
+                            and getattr(layer, "_pc_spec_enabled", False)
+                            and layer._spec_inited is not None):
+                            layer._spec_inited[batch_idx] = False
+
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
