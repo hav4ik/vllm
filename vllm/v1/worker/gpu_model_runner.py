@@ -1367,7 +1367,47 @@ class GPUModelRunner(
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
+        # Save pre-condense req_id→index mapping for spec slot rearrangement
+        _pre_condense_mapping = None
+        if (self.speculative_config is not None
+            and self.cache_config.mamba_cache_mode == "all"):
+            _pre_condense_mapping = dict(self.input_batch.req_id_to_index)
         self.input_batch.condense()
+
+        # Rearrange mamba spec slot data after condense
+        if _pre_condense_mapping is not None:
+            from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+            post_mapping = self.input_batch.req_id_to_index
+            # Find requests that moved positions
+            moves = []  # (old_pos, new_pos)
+            for req_id, new_pos in post_mapping.items():
+                old_pos = _pre_condense_mapping.get(req_id)
+                if old_pos is not None and old_pos != new_pos:
+                    moves.append((old_pos, new_pos))
+            if moves:
+                for layer in (
+                    self.compilation_config.static_forward_context.values()
+                ):
+                    if (isinstance(layer, MambaMixer2)
+                        and getattr(layer, "_pc_spec_enabled", False)
+                        and layer.spec_ssm is not None):
+                        K1 = layer._spec_K1
+                        for old_pos, new_pos in moves:
+                            old_base = 1 + old_pos * K1
+                            new_base = 1 + new_pos * K1
+                            old_slots = slice(old_base, old_base + K1)
+                            new_slots = slice(new_base, new_base + K1)
+                            # Copy SSM spec data
+                            layer.spec_ssm[new_slots] = (
+                                layer.spec_ssm[old_slots].clone())
+                            # Copy conv spec data
+                            layer.spec_conv[new_slots] = (
+                                layer.spec_conv[old_slots].clone())
+                            # Move init flag
+                            layer._spec_inited[new_pos] = (
+                                layer._spec_inited[old_pos])
+                            layer._spec_inited[old_pos] = False
+
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
