@@ -896,13 +896,42 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     1, block_idx_last_computed_token_d.unsqueeze(1)
                 ).squeeze(1).long()
 
-                # Init copy: pool[canonical] → scratch[base+0]
                 slot_base_long = self._pc_spec_slot_base_long[:num_decodes]
+
+                # Init copy: pool[canonical] → scratch[base+0].
+                # This initializes scratch on the FIRST decode step
+                # (when scratch[base+0] is zeros). On subsequent steps,
+                # it overwrites base+0 with stale pool data — but we
+                # fix that immediately below with the in-scratch copy.
                 self.spec_scratch_ssm_state.index_copy_(
                     0,
                     slot_base_long,
                     ssm_state.index_select(0, canonical_in_slot),
                 )
+
+                # In-scratch promotion: copy the PREVIOUS step's accepted
+                # state to scratch[base+0]. This overwrites the stale pool
+                # data from the init copy above.
+                #
+                # On the first step: num_accepted_prev = 1, so this copies
+                # scratch[base+0] to scratch[base+0] — a no-op. The init
+                # copy's data (from the pool) is preserved. ✓
+                #
+                # On subsequent steps: num_accepted_prev = N > 0, copies
+                # scratch[base+N-1] to scratch[base+0]. The correct
+                # accepted state replaces the stale pool data. ✓
+                if num_accepted_tokens is not None:
+                    prev_accepted_offset = (
+                        num_accepted_tokens[:num_decodes].long() - 1
+                    ).clamp(min=0)
+                    prev_accepted_slot = slot_base_long + prev_accepted_offset
+                    self.spec_scratch_ssm_state.index_copy_(
+                        0,
+                        slot_base_long,
+                        self.spec_scratch_ssm_state.index_select(
+                            0, prev_accepted_slot
+                        ),
+                    )
 
                 # SSM kernel uses K+1 scratch slot IDs (native rollback)
                 state_indices_tensor_d_input = (
