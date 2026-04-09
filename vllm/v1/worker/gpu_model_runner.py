@@ -1522,6 +1522,10 @@ class GPUModelRunner(
             # PC + spec: commit boundary states from spec slots → pool
             if (self.speculative_config is not None
                 and self.cache_config.mamba_cache_mode == "all"):
+                # Ensure all prior GPU ops (including async block table
+                # copies and spec decode kernels) have completed before
+                # reading state_indices_tensor_d in the commit.
+                torch.cuda.synchronize()
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
                     MambaMixer2)
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
