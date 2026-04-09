@@ -890,11 +890,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 and num_accepted_tokens is not None
             )
             if use_spec_scratch_path:
-                # Lazy-init the scratch tensor on first decode call so we
-                # know the device + dtype + per-slot shape from the bound
-                # ssm_state.
-                if self.spec_scratch_ssm_state is None:
-                    self._init_spec_scratch_ssm_state(ssm_state)
+                # Scratch tensor is eagerly allocated by gpu_model_runner
+                # right after bind_kv_cache (so it lives outside any
+                # cudagraph capture region). If it's still None here we
+                # were skipped — fall through to a NoneType error so
+                # the bug is loud, not silent.
+                assert self.spec_scratch_ssm_state is not None, (
+                    "spec_scratch_ssm_state was not eagerly allocated by "
+                    "gpu_model_runner.initialize_kv_cache_tensors. Check "
+                    "that the post-bind_kv_cache hook is firing for this "
+                    "layer."
+                )
                 # Compute the canonical "current state" slot for each decode
                 # request (the one we'll read FROM and later commit back TO).
                 canonical_in_slot_ids_d = state_indices_tensor_d.gather(
