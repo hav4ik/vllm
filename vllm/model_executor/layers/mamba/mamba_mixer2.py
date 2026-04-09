@@ -1076,13 +1076,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 )
 
                 # ===========================================================
-                # 4. Pre-step copy: ssm_state[canonical_in_slot] →
-                #    scratch[scratch_slot_base + 0].
-                #    The kernel reads from scratch_slot_base + init_token_idx
-                #    (where init_token_idx comes from num_accepted of the
-                #    previous step). Because state_indices_tensor_d_input is
-                #    set to scratch_slot_base broadcast across all K+1
-                #    columns, the kernel always reads from the +0 entry.
+                # 4. Initialization copy: pool → scratch[base+0].
+                #    ONLY needed on the first decode step after prefill
+                #    (when scratch[base+0] hasn't been populated yet).
+                #    We ALWAYS do this copy because it's harmless when
+                #    the kernel reads from base+init_token_idx > 0 (the
+                #    copy only affects base+0, which isn't read). When
+                #    init_token_idx = 0 (num_accepted_prev = 1), this
+                #    copy ensures base+0 has valid data from the pool.
+                #
+                #    NOTE: this is the ONLY pool→scratch copy per step.
+                #    There is NO scratch→pool commit on non-boundary
+                #    steps. States persist in scratch across steps, and
+                #    the kernel's built-in init_token_idx rollback
+                #    handles candidate selection (just like the no-PC
+                #    path). This eliminates the round-trip that was
+                #    causing the 92% → 50% accuracy degradation.
                 # ===========================================================
                 self.spec_scratch_ssm_state.index_copy_(
                     0,
@@ -1091,31 +1100,34 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 )
 
                 # ===========================================================
-                # 5. Stash for the worker's post-verify commit.
-                #    The first entry is the DESTINATION slot (per request),
-                #    the second is the source slot base (per request). Both
-                #    are LONG-typed slices of layer-attribute buffers, so
-                #    the storage is stable across the
-                #    captured-forward → eager-commit boundary.
+                # 5. Stash for the worker's boundary-only commit.
+                #    The commit hook now ONLY fires at block boundaries
+                #    (where canonical_dst_slot != canonical_in_slot) to
+                #    save the boundary state to the pool for prefix cache.
+                #    On non-boundary steps, it does an IN-SCRATCH copy:
+                #    scratch[base+N-1] → scratch[base+0], so that the
+                #    next step's init_token_idx=0 case reads the correct
+                #    accepted state.
                 # ===========================================================
                 self._spec_scratch_pending = (
                     canonical_dst_slot_long_buf,
                     scratch_slot_base_long,
+                    canonical_in_slot_long_buf,
                 )
 
                 # ===========================================================
-                # 6. Pre-computed kernel state indices.
-                #    Input: all K+1 entries point to scratch_slot_base + 0.
-                #    Output: per request, either
-                #      [base+0, base+1, ..., base+K]   (safe)
-                #    or
-                #      [base+0, NULL,   ..., NULL  ]   (unsafe — kernel
-                #                                       skips writes for
-                #                                       NULL_BLOCK_ID slots)
-                #    Combined via torch.where row-wise.
+                # 6. Kernel state indices.
+                #    BOTH input and output use [base+0, base+1, ..., base+K].
+                #    The kernel reads from input[init_token_idx] which
+                #    selects the correct slot based on num_accepted_prev.
+                #    This matches the no-PC path exactly — no broadcast,
+                #    no special handling needed.
+                #
+                #    For unsafe (boundary) requests: output slots 1..K are
+                #    NULL_BLOCK_ID so the kernel skips writes beyond token 0.
                 # ===========================================================
-                state_indices_tensor_d_input = (
-                    self._spec_scratch_state_indices_input_int32[:num_decodes]
+                scratch_output_indices = (
+                    self._spec_scratch_state_indices_output_int32[:num_decodes]
                 )
                 output_combined_buf = (
                     self._spec_scratch_state_indices_output_combined_int32[
@@ -1127,9 +1139,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     self._spec_scratch_state_indices_unsafe_output_int32[
                         :num_decodes
                     ],
-                    self._spec_scratch_state_indices_output_int32[:num_decodes],
+                    scratch_output_indices,
                     out=output_combined_buf,
                 )
+                # Input = same as output (non-broadcast). init_token_idx
+                # selects which slot to read from.
+                state_indices_tensor_d_input = scratch_output_indices
                 state_indices_tensor_d_output = output_combined_buf
 
                 # Use the scratch tensor as the "ssm_state" for the kernel
@@ -1493,33 +1508,55 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if self._spec_scratch_pending is None:
             # No spec-scratch path was taken this step (e.g. prefill-only)
             return
-        # Both entries in _spec_scratch_pending are pre-allocated long-typed
-        # SLICES of layer-attribute buffers (see _init_spec_scratch_ssm_state).
-        # No .long() conversion needed.
-        canonical_dst_long, scratch_slot_base_long = self._spec_scratch_pending
+        # Pending now has 3 entries: (canonical_dst, scratch_base, canonical_in)
+        canonical_dst_long, scratch_slot_base_long, canonical_in_long = (
+            self._spec_scratch_pending
+        )
         num_decodes = canonical_dst_long.shape[0]
 
         # src_idx[i] = scratch_slot_base[i] + num_accepted[i] - 1
-        # This is the slot containing the state after the i-th request's
-        # last accepted token of this step's spec verify. We materialize
-        # the result in a pre-allocated long buffer (_spec_scratch_src_indices_long)
-        # to avoid per-call allocations.
+        # This is the scratch slot containing the accepted post-state.
         src_idx_long = self._spec_scratch_src_indices_long[:num_decodes]
-        # Compute into the buffer in-place: copy_ accepts a broadcasted
-        # arithmetic expression and handles the int32→int64 cast.
         src_idx_long.copy_(
             scratch_slot_base_long + num_accepted_tokens[:num_decodes] - 1
         )
 
         assert self.spec_scratch_ssm_state is not None
-        ssm_state = self.kv_cache[1]
-        # Use index_copy_ instead of fancy-indexed assignment so the dst
-        # dim is explicit and no fancy-indexing semantics ambiguity.
-        ssm_state.index_copy_(
+
+        # IN-SCRATCH copy: scratch[base+N-1] → scratch[base+0].
+        # This ensures that on the NEXT step, if init_token_idx = 0
+        # (num_accepted = 1), the kernel reads the correct accepted
+        # state from base+0. This replaces the old pool round-trip
+        # (scratch→pool→scratch) with a cheap in-scratch copy.
+        self.spec_scratch_ssm_state.index_copy_(
             0,
-            canonical_dst_long,
+            scratch_slot_base_long,
             self.spec_scratch_ssm_state.index_select(0, src_idx_long),
         )
+
+        # BOUNDARY COMMIT: at block boundaries (unsafe requests where
+        # canonical_dst != canonical_in), commit the accepted state
+        # to the pool so the prefix cache can snapshot the boundary.
+        # On non-boundary steps, skip the pool write entirely — states
+        # persist in scratch.
+        #
+        # Check if ANY request has a boundary crossing:
+        has_boundary = (canonical_dst_long != canonical_in_long).any()
+        if has_boundary:
+            ssm_state = self.kv_cache[1]
+            # For boundary requests: write scratch[base+0] (which now
+            # has the accepted state from the in-scratch copy above)
+            # to pool[canonical_dst].
+            # For non-boundary requests: canonical_dst == canonical_in,
+            # so this writes the accepted state to the same slot the
+            # next step's init copy will read from (harmless).
+            ssm_state.index_copy_(
+                0,
+                canonical_dst_long,
+                self.spec_scratch_ssm_state.index_select(
+                    0, scratch_slot_base_long
+                ),
+            )
 
         # Conv state: NO scratch commit needed. Conv state goes directly
         # through the regular pool (no scratch round-trip). See the
