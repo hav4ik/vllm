@@ -1487,14 +1487,14 @@ class GPUModelRunner(
                 and self.cache_config.mamba_cache_mode == "all"
             ):
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-                    Mamba2Mixer,
+                    MambaMixer2,
                 )
 
                 num_accepted_tokens_gpu = self.num_accepted_tokens.gpu[:num_reqs]
                 for layer in (
                     self.compilation_config.static_forward_context.values()
                 ):
-                    if isinstance(layer, Mamba2Mixer):
+                    if isinstance(layer, MambaMixer2):
                         layer.commit_spec_scratch_to_canonical(
                             num_accepted_tokens_gpu
                         )

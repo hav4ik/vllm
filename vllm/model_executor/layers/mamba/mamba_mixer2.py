@@ -903,27 +903,39 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
                 # Per-batch-position scratch slot base IDs. Each running
                 # request at batch position i owns scratch slots
-                #   [i*(K+1), i*(K+1)+1, ..., i*(K+1)+K]
-                # in spec_scratch_ssm_state. Stable for the request's
-                # position in the batch — when a request leaves the batch
-                # the next request in that position simply overwrites the
-                # slots from scratch.
+                #   [1 + i*(K+1), 1 + i*(K+1) + 1, ..., 1 + i*(K+1) + K]
+                # in spec_scratch_ssm_state. The +1 offset is critical:
+                # slot 0 is reserved as NULL_BLOCK_ID (= 0 in
+                # vllm/v1/attention/backends/utils.py), and the kernel
+                # skips reads/writes to that slot. Without the +1 offset,
+                # request at batch position 0 would have scratch_slot_base
+                # = 0, its dst[0] would be 0 = NULL_BLOCK_ID, and the
+                # kernel would silently skip writing the state-after-
+                # token-0 output, leaving scratch[0] at zero. The commit
+                # would then overwrite the canonical state with zeros,
+                # corrupting the model irrecoverably.
                 slots_per_req = self._spec_scratch_slots_per_req
                 req_batch_indices = torch.arange(
                     num_decodes,
                     device=state_indices_tensor_d.device,
                     dtype=torch.int32,
                 )
-                scratch_slot_base = req_batch_indices * slots_per_req
+                scratch_slot_base = 1 + req_batch_indices * slots_per_req
 
                 # Pre-step copy: ssm_state[canonical_slot] -> scratch[base + 0]
                 # This populates the kernel's input slot. The kernel's
                 # state_batch_indices points to scratch[base + 0..K] for all
                 # K+1 entries (so init_token_idx is irrelevant — we always
                 # read from base+0).
-                self.spec_scratch_ssm_state[scratch_slot_base.long()] = ssm_state[
-                    canonical_in_slot_ids_d.long()
-                ]
+                #
+                # Use index_copy_ instead of fancy indexed assignment so that
+                # the dst dim and src dim are explicit (avoids any ambiguity
+                # in stream ordering / fancy indexing semantics).
+                self.spec_scratch_ssm_state.index_copy_(
+                    0,
+                    scratch_slot_base.long(),
+                    ssm_state.index_select(0, canonical_in_slot_ids_d.long()),
+                )
 
                 # Stash for the worker's post-verify commit.
                 # gpu_model_runner._update_states_after_model_execute will
@@ -1042,20 +1054,53 @@ class MambaMixer2(MambaBase, PluggableLayer):
         """Lazily allocate the spec-decode scratch SSM state tensor.
 
         Called on the first decode call when prefix caching + spec decode
-        are both enabled. Uses the bound ssm_state's per-slot shape and
-        dtype so the kernel can use it interchangeably.
+        are both enabled. Uses the bound ssm_state's per-slot shape, dtype,
+        AND stride pattern so the kernel can use it interchangeably with
+        the regular pool.
+
+        IMPORTANT: vLLM's mamba pool ssm_state is created via
+        torch.as_strided with stride[0] = num_element_per_page, where
+        num_element_per_page is the SHARED page size for the entire mamba
+        state (conv_state + ssm_state share a page). This means ssm_state's
+        stride(0) is LARGER than the standard contiguous stride if there's
+        padding. We must allocate the scratch tensor with the same
+        stride(0) so that copies between scratch and ssm_state preserve
+        the per-slot data layout.
 
         Shape: (max_running_seqs * (1 + num_spec), *per_slot_shape)
+        Stride: matches ssm_state's stride[0] for the leading slot dim,
+                contiguous for the inner dims.
         """
         assert self._spec_scratch_enabled
         per_slot_shape = ssm_state.shape[1:]
+        # +1 for the unused slot 0 (NULL_BLOCK_ID sentinel — the kernel
+        # silently skips reads/writes to slot 0). See the +1 offset in
+        # the scratch_slot_base computation in conv_ssm_forward.
         total_slots = (
             self._spec_scratch_max_running_seqs * self._spec_scratch_slots_per_req
+            + 1
         )
-        self.spec_scratch_ssm_state = torch.zeros(
-            (total_slots, *per_slot_shape),
+        # Allocate via raw bytes so we can match the strided layout exactly.
+        # The ssm_state stride[0] in elements gives us the page size.
+        page_size_elements = ssm_state.stride(0)
+        # Compute inner strides from the per_slot_shape (contiguous within
+        # a slot — only the leading slot dim has the page-padded stride).
+        inner_stride = torch.empty(per_slot_shape).stride()
+        target_stride = (page_size_elements, *inner_stride)
+        # Total raw element count = total_slots * page_size_elements
+        # (this includes the per-slot padding region between
+        # consecutive slots, which is wasted but lets us share strides
+        # with the regular pool).
+        raw = torch.zeros(
+            total_slots * page_size_elements,
             dtype=ssm_state.dtype,
             device=ssm_state.device,
+        )
+        self.spec_scratch_ssm_state = torch.as_strided(
+            raw,
+            size=(total_slots, *per_slot_shape),
+            stride=target_stride,
+            storage_offset=0,
         )
 
     def commit_spec_scratch_to_canonical(
@@ -1107,9 +1152,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
         canonical_dst_indices = canonical_dst_slot_ids.long()
         assert self.spec_scratch_ssm_state is not None
         ssm_state = self.kv_cache[1]
-        ssm_state[canonical_dst_indices] = self.spec_scratch_ssm_state[
-            scratch_src_indices
-        ]
+        # Use index_copy_ instead of fancy-indexed assignment so the dst
+        # dim is explicit and no fancy-indexing semantics ambiguity.
+        ssm_state.index_copy_(
+            0,
+            canonical_dst_indices,
+            self.spec_scratch_ssm_state.index_select(0, scratch_src_indices),
+        )
         # Clear the pending so a subsequent call (or a no-spec step) is a no-op
         self._spec_scratch_pending = None
 
