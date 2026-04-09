@@ -1204,7 +1204,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     initial_state_idx=None,
                     num_accepted_tokens=num_accepted_tokens,
                     query_start_loc=query_start_loc_d,
-                    max_query_len=conv_scratch_indices.size(-1),
+                    # CRITICAL: max_query_len must be K+1 (not 1) so
+                    # that the causal_conv1d_update Python wrapper
+                    # computes state_len = width-1 + (K+1-1) = 7 (the
+                    # widened state length). With max_query_len=1, it
+                    # computes state_len=3 and the kernel reads/writes
+                    # only 3 positions, breaking spec decode semantics.
+                    max_query_len=self._spec_scratch_slots_per_req,
                 )
             else:
                 hidden_states_B_C_d = causal_conv1d_update(
