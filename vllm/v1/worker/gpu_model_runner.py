@@ -1461,6 +1461,44 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
+            # ============================================================
+            # PC + spec decode + Mamba2 shadow-slot scratch commit.
+            #
+            # When prefix caching ('all' mode) is enabled together with
+            # speculative decoding for a hybrid (NemotronH-style) model,
+            # each Mamba2Mixer layer has been writing its spec verify
+            # outputs into a dedicated SCRATCH SSM state tensor that is
+            # absolutely segregated from the regular pool — this prevents
+            # the radix tree from caching contaminated boundary states.
+            #
+            # Now that the rejection sampler has determined how many
+            # tokens were accepted per request, copy the accepted state
+            # from each layer's scratch back to its canonical block slot.
+            # This MUST run before the scheduler's cache_blocks() commits
+            # blocks to the prefix cache (which happens later, in
+            # update_from_output), so the cache committer reads the
+            # correct state.
+            #
+            # See _pc_spec_decode_upstream_status.md and
+            # mamba_mixer2.py::Mamba2Mixer.commit_spec_scratch_to_canonical
+            # for the design rationale.
+            if (
+                self.speculative_config is not None
+                and self.cache_config.mamba_cache_mode == "all"
+            ):
+                from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+                    Mamba2Mixer,
+                )
+
+                num_accepted_tokens_gpu = self.num_accepted_tokens.gpu[:num_reqs]
+                for layer in (
+                    self.compilation_config.static_forward_context.values()
+                ):
+                    if isinstance(layer, Mamba2Mixer):
+                        layer.commit_spec_scratch_to_canonical(
+                            num_accepted_tokens_gpu
+                        )
+
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:

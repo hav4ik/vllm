@@ -492,6 +492,50 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         self.num_spec = vllm_config.num_speculative_tokens
 
+        # ===========================================================
+        # PC + Spec decode shadow-slot scratch tensor (NemotronH-only fix).
+        #
+        # When prefix caching ('all' mode) AND speculative decoding are
+        # both enabled, the regular ssm_state pool MUST NOT be used as
+        # the kernel's per-token write target — doing so contaminates
+        # boundary states cached by the prefix-cache committer when a
+        # spec verify step crosses a mamba block boundary.
+        #
+        # Instead, we allocate a dedicated SCRATCH tensor that is
+        # absolutely segregated from the regular pool: it's a separate
+        # torch.Tensor on the same device, never registered with
+        # BlockPool, never hashed by the radix tree, never visible to
+        # MambaManager. The kernel reads/writes to this scratch tensor
+        # for spec verify, and after the rejection sampler runs we copy
+        # the accepted state back to the canonical block slot in the
+        # regular ssm_state pool.
+        #
+        # Memory cost (per layer):
+        #   max_running_seqs * (1 + num_spec) slots * per_slot_size
+        # E.g. for max_num_seqs=16, K=4 spec tokens, fp16 ssm state:
+        #   16 * 5 * 1.5 MB ≈ 120 MB / layer × 31 layers ≈ 3.7 GB total
+        # At fp32 the cost doubles. Allocated lazily on first decode
+        # call so we know the device + dtype + actual ssm_state shape.
+        #
+        # See docs/features/_pc_spec_decode_upstream_status.md for the
+        # full design writeup.
+        self._spec_scratch_enabled = (
+            self.num_spec > 0
+            and self.cache_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+        )
+        self.spec_scratch_ssm_state: torch.Tensor | None = None
+        # Per-step pending commit info: tuple of
+        #   (canonical_dst_slot_ids, scratch_slot_base)
+        # populated at the start of each decode-with-spec-PC forward,
+        # consumed by commit_spec_scratch_to_canonical() after the
+        # rejection sampler runs.
+        self._spec_scratch_pending: tuple[torch.Tensor, torch.Tensor] | None = None
+        if self._spec_scratch_enabled:
+            scheduler_config = vllm_config.scheduler_config
+            self._spec_scratch_max_running_seqs = scheduler_config.max_num_seqs
+            self._spec_scratch_slots_per_req = 1 + self.num_spec
+
         # Pre-compute sizes for forward pass
         self.tped_intermediate_size = self.intermediate_size // self.tp_size
         self.tped_conv_size = self.conv_dim // self.tp_size
@@ -819,7 +863,97 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
-            if is_mamba_cache_all:
+            # ================================================================
+            # PC + Spec decode shadow-slot scratch path (NemotronH-only fix).
+            #
+            # When prefix caching is enabled AND speculative decoding is
+            # active, we MUST NOT let the kernel write spec-verify
+            # intermediate states to slots in the regular ssm_state pool —
+            # those slots are committed verbatim to the prefix cache by
+            # the radix-tree committer when blocks become full, and would
+            # contaminate cached boundary states for future requests.
+            #
+            # Instead, route reads/writes through self.spec_scratch_ssm_state
+            # (a pre-allocated tensor that is absolutely segregated from the
+            # regular pool, never visible to BlockPool / MambaManager / the
+            # radix tree). After the rejection sampler runs, the worker
+            # copies the accepted state back to the canonical block slot in
+            # the regular pool — that copy lives in
+            # gpu_model_runner._update_states_after_model_execute and uses
+            # the per-layer commit_spec_scratch_to_canonical helper below.
+            #
+            # See docs/features/_pc_spec_decode_upstream_status.md for the
+            # full design writeup.
+            use_spec_scratch_path = (
+                is_mamba_cache_all
+                and self._spec_scratch_enabled
+                and num_accepted_tokens is not None
+            )
+            if use_spec_scratch_path:
+                # Lazy-init the scratch tensor on first decode call so we
+                # know the device + dtype + per-slot shape from the bound
+                # ssm_state.
+                if self.spec_scratch_ssm_state is None:
+                    self._init_spec_scratch_ssm_state(ssm_state)
+                # Compute the canonical "current state" slot for each decode
+                # request (the one we'll read FROM and later commit back TO).
+                canonical_in_slot_ids_d = state_indices_tensor_d.gather(
+                    1, block_idx_last_computed_token_d.unsqueeze(1)
+                ).squeeze(1)
+
+                # Per-batch-position scratch slot base IDs. Each running
+                # request at batch position i owns scratch slots
+                #   [i*(K+1), i*(K+1)+1, ..., i*(K+1)+K]
+                # in spec_scratch_ssm_state. Stable for the request's
+                # position in the batch — when a request leaves the batch
+                # the next request in that position simply overwrites the
+                # slots from scratch.
+                slots_per_req = self._spec_scratch_slots_per_req
+                req_batch_indices = torch.arange(
+                    num_decodes,
+                    device=state_indices_tensor_d.device,
+                    dtype=torch.int32,
+                )
+                scratch_slot_base = req_batch_indices * slots_per_req
+
+                # Pre-step copy: ssm_state[canonical_slot] -> scratch[base + 0]
+                # This populates the kernel's input slot. The kernel's
+                # state_batch_indices points to scratch[base + 0..K] for all
+                # K+1 entries (so init_token_idx is irrelevant — we always
+                # read from base+0).
+                self.spec_scratch_ssm_state[scratch_slot_base.long()] = ssm_state[
+                    canonical_in_slot_ids_d.long()
+                ]
+
+                # Stash for the worker's post-verify commit.
+                # gpu_model_runner._update_states_after_model_execute will
+                # iterate over all Mamba2Mixer layers and call
+                # commit_spec_scratch_to_canonical(num_accepted_tokens),
+                # which uses this pending info to do the copy back.
+                self._spec_scratch_pending = (
+                    canonical_in_slot_ids_d,
+                    scratch_slot_base,
+                )
+
+                # State indices for the kernel: input is all base+0, output
+                # is base+0 .. base+K (so the kernel writes K+1 distinct
+                # slots, one per candidate token).
+                state_indices_tensor_d_input = scratch_slot_base.unsqueeze(
+                    1
+                ).expand(-1, slots_per_req).contiguous().to(torch.int32)
+                offsets = torch.arange(
+                    slots_per_req,
+                    device=state_indices_tensor_d.device,
+                    dtype=torch.int32,
+                )
+                state_indices_tensor_d_output = (
+                    scratch_slot_base.unsqueeze(1) + offsets.unsqueeze(0)
+                ).contiguous()
+
+                # Use the scratch tensor as the "ssm_state" for the kernel
+                # call below.
+                ssm_state_for_kernel = self.spec_scratch_ssm_state
+            elif is_mamba_cache_all:
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
                     1, block_idx_last_computed_token_d.unsqueeze(1)
                 ).squeeze(1)
@@ -832,12 +966,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # at block boundaries:
                 #   block_idx_first_scheduled_token_d >
                 #       block_idx_last_computed_token_d
+                ssm_state_for_kernel = ssm_state
             else:
                 # Without caching, read and write in-place to the same blocks:
                 state_indices_tensor_d_input = state_indices_tensor_d
                 state_indices_tensor_d_output = state_indices_tensor_d
+                ssm_state_for_kernel = ssm_state
 
             # 2. Convolution sequence transformation
+            # NOTE: conv1d state is widened in the inner state_len dim by
+            # num_spec (mamba_utils.py:174), so it stays in the regular
+            # conv_state pool — only the SSM state needs scratch redirection.
             hidden_states_B_C_d = causal_conv1d_update(
                 hidden_states_B_C_d,
                 conv_state,
@@ -874,11 +1013,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             assert preallocated_ssm_out_d is not None
             # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - mamba_cache_params.ssm_state's slots will be selected
-            #   using state_indices_tensor_d
+            # - When use_spec_scratch_path is True, ssm_state_for_kernel is
+            #   self.spec_scratch_ssm_state and the slot indices point into
+            #   it. Otherwise it's the regular ssm_state.
             # NOTE: final output is an in-place update of out tensor
             selective_state_update(
-                ssm_state,
+                ssm_state_for_kernel,
                 hidden_states_d,
                 dt_d,
                 A_d,
@@ -897,6 +1037,81 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 enable_stochastic_rounding=self.cache_config.enable_mamba_cache_stochastic_rounding,
                 cache_philox_rounds=self.cache_config.mamba_cache_philox_rounds,
             )
+
+    def _init_spec_scratch_ssm_state(self, ssm_state: torch.Tensor) -> None:
+        """Lazily allocate the spec-decode scratch SSM state tensor.
+
+        Called on the first decode call when prefix caching + spec decode
+        are both enabled. Uses the bound ssm_state's per-slot shape and
+        dtype so the kernel can use it interchangeably.
+
+        Shape: (max_running_seqs * (1 + num_spec), *per_slot_shape)
+        """
+        assert self._spec_scratch_enabled
+        per_slot_shape = ssm_state.shape[1:]
+        total_slots = (
+            self._spec_scratch_max_running_seqs * self._spec_scratch_slots_per_req
+        )
+        self.spec_scratch_ssm_state = torch.zeros(
+            (total_slots, *per_slot_shape),
+            dtype=ssm_state.dtype,
+            device=ssm_state.device,
+        )
+
+    def commit_spec_scratch_to_canonical(
+        self,
+        num_accepted_tokens: torch.Tensor,
+    ) -> None:
+        """Copy accepted spec scratch slots back to the canonical pool.
+
+        Called by the worker (gpu_model_runner) after the rejection sampler
+        determines per-request accept counts. Uses the per-step pending info
+        stashed in self._spec_scratch_pending by the most recent forward()
+        call. If no spec-scratch path was taken (e.g. this layer is in a
+        prefill-only step), this is a no-op.
+
+        This MUST run before the scheduler's cache_blocks() commits any
+        block to the prefix cache, otherwise the cache committer will read
+        the stale (pre-step) state from the canonical slot. The worker is
+        responsible for ordering this correctly.
+
+        Args:
+            num_accepted_tokens: int32 tensor (num_decodes,) of accepted
+                token counts (output of the rejection sampler). Each entry
+                is in [1, K+1].
+
+        NOTE: this commits to the SAME canonical block slot we read from
+        during the forward (block_idx_last_computed_token_d). For the
+        ~1% of spec verify steps where the K+1 candidates cross a mamba
+        block boundary, the new "current" state should land in the NEW
+        block slot, not the old one — handling that case is left as
+        future work (it would require pre-computing K+1 candidate
+        canonical destinations per request and indexing them by j).
+        """
+        if not self._spec_scratch_enabled:
+            return
+        if self._spec_scratch_pending is None:
+            # No spec-scratch path was taken this step (e.g. prefill-only)
+            return
+        canonical_dst_slot_ids, scratch_slot_base = self._spec_scratch_pending
+        # src_idx[i] = scratch_slot_base[i] + num_accepted[i] - 1
+        # This is the slot containing the state after the i-th request's
+        # last accepted token of this step's spec verify.
+        num_decodes = canonical_dst_slot_ids.shape[0]
+        scratch_src_indices = (
+            scratch_slot_base + num_accepted_tokens[:num_decodes].to(
+                scratch_slot_base.dtype
+            )
+            - 1
+        ).long()
+        canonical_dst_indices = canonical_dst_slot_ids.long()
+        assert self.spec_scratch_ssm_state is not None
+        ssm_state = self.kv_cache[1]
+        ssm_state[canonical_dst_indices] = self.spec_scratch_ssm_state[
+            scratch_src_indices
+        ]
+        # Clear the pending so a subsequent call (or a no-spec step) is a no-op
+        self._spec_scratch_pending = None
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
