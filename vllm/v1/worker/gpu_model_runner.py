@@ -1480,7 +1480,7 @@ class GPUModelRunner(
             # correct state.
             #
             # See _pc_spec_decode_upstream_status.md and
-            # mamba_mixer2.py::Mamba2Mixer.commit_spec_scratch_to_canonical
+            # mamba_mixer2.py::MambaMixer2.commit_spec_scratch_to_canonical
             # for the design rationale.
             if (
                 self.speculative_config is not None
