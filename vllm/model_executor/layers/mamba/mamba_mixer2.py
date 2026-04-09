@@ -1161,73 +1161,28 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # scratch, run the kernel with scratch (non-APC mode so the
             # widened state + num_accepted offset logic handles per-
             # candidate rollback), then commit in the post-step hook.
-            if use_spec_scratch_path:
-                assert self.spec_scratch_conv_state is not None
-                # Apply the same layout transpose to the scratch as the
-                # regular pool. The scratch was allocated from kv_cache[0]
-                # (raw SD layout); the kernel expects DS layout (same as
-                # the `conv_state` variable above). transpose(-1, -2) is
-                # a zero-copy view so no extra memory.
-                conv_scratch_view = (
-                    self.spec_scratch_conv_state
-                    if is_conv_state_dim_first()
-                    else self.spec_scratch_conv_state.transpose(-1, -2)
-                )
-                # Pre-copy conv_state[canonical_in_slot] → scratch[base]
-                conv_scratch_view.index_copy_(
-                    0,
-                    scratch_slot_base_long,
-                    conv_state.index_select(
-                        0, canonical_in_slot_long_buf
-                    ),
-                )
-                # Build 1-column conv_state_indices pointing at scratch
-                # base slots. The causal_conv1d_update kernel in non-APC
-                # mode (block_idx_last_scheduled_token=None) uses column
-                # 0 for both read and write. Shape (num_decodes, 1).
-                conv_scratch_indices = (
-                    self._spec_scratch_slot_base_int32[:num_decodes]
-                    .unsqueeze(1)
-                )
-                hidden_states_B_C_d = causal_conv1d_update(
-                    hidden_states_B_C_d,
-                    conv_scratch_view,
-                    self.conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=conv_scratch_indices,
-                    # Pass None for APC args → IS_APC_ENABLED=False in
-                    # the kernel. This makes the kernel use the non-PC
-                    # spec decode path (widened state + conv_state_token_
-                    # offset from num_accepted_tokens).
-                    block_idx_last_scheduled_token=None,
-                    initial_state_idx=None,
-                    num_accepted_tokens=num_accepted_tokens,
-                    query_start_loc=query_start_loc_d,
-                    # CRITICAL: max_query_len must be K+1 (not 1) so
-                    # that the causal_conv1d_update Python wrapper
-                    # computes state_len = width-1 + (K+1-1) = 7 (the
-                    # widened state length). With max_query_len=1, it
-                    # computes state_len=3 and the kernel reads/writes
-                    # only 3 positions, breaking spec decode semantics.
-                    max_query_len=self._spec_scratch_slots_per_req,
-                )
-            else:
-                hidden_states_B_C_d = causal_conv1d_update(
-                    hidden_states_B_C_d,
-                    conv_state,
-                    self.conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=state_indices_tensor_d,
-                    block_idx_last_scheduled_token=(
-                        block_idx_last_scheduled_token_d
-                    ),
-                    initial_state_idx=block_idx_last_computed_token_d,
-                    num_accepted_tokens=num_accepted_tokens,
-                    query_start_loc=query_start_loc_d,
-                    max_query_len=state_indices_tensor_d.size(-1),
-                )
+            # Conv state: use the regular pool directly (no scratch).
+            # With prefix cache hits at 0% (upstream issue #38182),
+            # contamination of cached conv boundary states doesn't
+            # matter — nobody reads them. This eliminates the conv
+            # round-trip (pool→scratch→pool) which was suspected of
+            # causing the accuracy degradation from 92% → 50%.
+            # The SSM state still uses scratch (needed for K+1 slots).
+            hidden_states_B_C_d = causal_conv1d_update(
+                hidden_states_B_C_d,
+                conv_state,
+                self.conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=state_indices_tensor_d,
+                block_idx_last_scheduled_token=(
+                    block_idx_last_scheduled_token_d
+                ),
+                initial_state_idx=block_idx_last_computed_token_d,
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=query_start_loc_d,
+                max_query_len=state_indices_tensor_d.size(-1),
+            )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
@@ -1566,23 +1521,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self.spec_scratch_ssm_state.index_select(0, src_idx_long),
         )
 
-        # Conv state commit: same destination slots, same scratch_slot_base
-        # source (column 0 in the non-APC kernel mode). The widened conv
-        # state at scratch[base] contains all K+1 candidates; the next
-        # step's kernel will use conv_state_token_offset = num_accepted - 1
-        # to select the right starting position in the widened dimension.
-        # Note: we use the RAW (non-transposed) view of both conv_state
-        # and scratch here — index_copy_ along dim=0 copies per-slot data
-        # element-by-element regardless of inner layout.
-        assert self.spec_scratch_conv_state is not None
-        conv_state_raw = self.kv_cache[0]
-        conv_state_raw.index_copy_(
-            0,
-            canonical_dst_long,
-            self.spec_scratch_conv_state.index_select(
-                0, scratch_slot_base_long
-            ),
-        )
+        # Conv state: NO scratch commit needed. Conv state goes directly
+        # through the regular pool (no scratch round-trip). See the
+        # comment in the forward path above the causal_conv1d_update call.
 
         # Clear the pending so a subsequent call (or a no-spec step) is a no-op
         self._spec_scratch_pending = None
