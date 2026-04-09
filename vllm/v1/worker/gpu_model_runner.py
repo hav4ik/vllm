@@ -1455,116 +1455,41 @@ class GPUModelRunner(
                 self._get_mamba_copy_bufs(),
             )
         else:
-            # ============================================================
-            # PC + spec decode + Mamba2 shadow-slot scratch commit.
-            #
-            # When prefix caching ('all' mode) is enabled together with
-            # speculative decoding for a hybrid (NemotronH-style) model,
-            # each Mamba2Mixer layer has been writing its spec verify
-            # outputs into a dedicated SCRATCH SSM state tensor that is
-            # absolutely segregated from the regular pool — this prevents
-            # the radix tree from caching contaminated boundary states.
-            #
-            # Below we (a) clamp num_accepted_tokens to 1 for any request
-            # whose verify step crosses a mamba block boundary (the
-            # disable-at-boundary fix from
-            # docs/features/_pc_spec_decode_three_approaches.md option 1),
-            # then (b) mirror num_accepted_tokens.gpu to the input batch's
-            # CPU tensor (so the runner emits exactly the right number of
-            # output tokens per request), then (c) call each Mamba2Mixer
-            # layer's commit hook to copy the accepted scratch state back
-            # to the canonical pool. The clamp MUST happen first so that
-            # downstream consumers (CPU mirror, output emitter, commit
-            # hook) all see the same per-request accept count.
-            #
-            # The commit hook MUST run before the scheduler's
-            # cache_blocks() commits blocks to the prefix cache (which
-            # happens later, in update_from_output), so the cache
-            # committer reads the correct state.
-            #
-            # See _pc_spec_decode_upstream_status.md and
-            # mamba_mixer2.py::MambaMixer2.commit_spec_scratch_to_canonical
-            # for the design rationale.
-
-            num_accepted_tokens_gpu = self.num_accepted_tokens.gpu[:num_reqs]
-            spec_pc_active = (
-                self.speculative_config is not None
-                and self.cache_config.mamba_cache_mode == "all"
-            )
-
-            first_mamba_layer = None
-            if spec_pc_active:
-                from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-                    MambaMixer2,
-                )
-
-                # All mamba layers see the same metadata so the unsafe
-                # mask is identical across them; we only need to read it
-                # from the first one we can find that participated in
-                # the spec scratch path this step.
-                for layer in (
-                    self.compilation_config.static_forward_context.values()
-                ):
-                    if isinstance(layer, MambaMixer2) and getattr(
-                        layer, "_spec_scratch_enabled", False
-                    ):
-                        first_mamba_layer = layer
-                        break
-
-            if (
-                first_mamba_layer is not None
-                and first_mamba_layer._spec_scratch_pending is not None
-            ):
-                # ----------------------------------------------------
-                # CLAMP num_accepted_tokens to 1 for unsafe requests.
-                # ----------------------------------------------------
-                # _spec_scratch_pending[0] is canonical_dst_slot_long_buf,
-                # whose first dim equals the number of decodes processed
-                # by this step. Use that as the slice length.
-                canonical_dst_long, _scratch_base = (
-                    first_mamba_layer._spec_scratch_pending
-                )
-                num_decodes_this_step = canonical_dst_long.shape[0]
-                # Slice both the unsafe mask buffer and the GPU
-                # num_accepted buffer to the same num_decodes prefix.
-                unsafe_mask_d = (
-                    first_mamba_layer._spec_scratch_unsafe_mask_bool[
-                        :num_decodes_this_step
-                    ]
-                )
-                num_accepted_decode = num_accepted_tokens_gpu[
-                    :num_decodes_this_step
-                ]
-                # In-place clamp: where unsafe, write 1; otherwise leave
-                # the rejection sampler's value unchanged.
-                # Note that this MUST happen BEFORE the CPU mirror copy
-                # and event record below, otherwise downstream consumers
-                # would see the unclamped values.
-                torch.where(
-                    unsafe_mask_d,
-                    torch.ones_like(num_accepted_decode),
-                    num_accepted_decode,
-                    out=num_accepted_decode,
-                )
-
-            # CPU mirror + event record. Order: clamp (above) → copy →
-            # event record. The event captures the post-clamp state so
-            # any wait()er sees the clamped values in the CPU tensor.
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
-            # Per-layer commit hook (no-op when not enabled, e.g., on
-            # prefill-only steps or non-PC mamba modes).
-            if spec_pc_active:
+            # v2 PC+spec: commit boundary states to pool.
+            # For each mamba layer, check if any request crossed a block
+            # boundary in this step. If so, copy the boundary-position
+            # state from scratch to the pool's block slot.
+            if (
+                self.speculative_config is not None
+                and self.cache_config.mamba_cache_mode == "all"
+            ):
+                from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+                    MambaMixer2,
+                )
+                num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
+                # num_computed_tokens BEFORE this step (= n_done per req)
+                num_computed_gpu = (
+                    self.input_batch.num_computed_tokens_cpu_tensor[
+                        :num_reqs
+                    ].to(self.device)
+                )
+                block_size = self.cache_config.mamba_block_size
                 for layer in (
                     self.compilation_config.static_forward_context.values()
                 ):
-                    if isinstance(layer, MambaMixer2):
-                        layer.commit_spec_scratch_to_canonical(
-                            num_accepted_tokens_gpu
+                    if isinstance(layer, MambaMixer2) and getattr(
+                        layer, "_pc_spec_v2_enabled", False
+                    ):
+                        layer.commit_boundary_states(
+                            num_accepted_gpu,
+                            num_computed_gpu,
+                            block_size,
                         )
 
     def _update_streaming_request(
@@ -6884,30 +6809,19 @@ class GPUModelRunner(
             num_attn_module,
         )
 
-        # ============================================================
-        # PC + spec decode + Mamba2 spec scratch tensor eager init.
-        #
-        # The MambaMixer2 layer pre-allocates a dedicated SCRATCH SSM
-        # state tensor when prefix caching + spec decode are both
-        # enabled. This MUST happen here (after kv_cache is bound,
-        # before cudagraph capture) so that the scratch tensor's
-        # storage is allocated outside any cudagraph capture context.
-        # If we leave this as a lazy init inside conv_ssm_forward, the
-        # allocation gets captured into the graph's memory pool and
-        # produces silent state corruption on cudagraph replay.
+        # v2 PC+spec: eagerly init scratch SSM tensors for all MambaMixer2
+        # layers AFTER bind_kv_cache (so kv_cache[1] = ssm_state exists).
         from vllm.model_executor.layers.mamba.mamba_mixer2 import (
             MambaMixer2,
         )
-
         for layer in self.compilation_config.static_forward_context.values():
             if (
                 isinstance(layer, MambaMixer2)
-                and getattr(layer, "_spec_scratch_enabled", False)
+                and getattr(layer, "_pc_spec_v2_enabled", False)
                 and layer.spec_scratch_ssm_state is None
             ):
-                conv_state = layer.kv_cache[0]
                 ssm_state = layer.kv_cache[1]
-                layer._init_spec_scratch_states(conv_state, ssm_state)
+                layer._init_pc_spec_v2_scratch(ssm_state)
 
         return kv_caches
 

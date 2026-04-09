@@ -50,10 +50,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
 logger = init_logger(__name__)
-
-# Module-level flag so the PC + spec-decode startup warning is logged
-# at most once per process, no matter how many MambaMixer2 layers exist.
-_PC_SPEC_BOUNDARY_WARNED = False
+_PC_SPEC_V2_WARNED = False
 
 # Added by the IBM Team, 2024
 
@@ -500,81 +497,42 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.num_spec = vllm_config.num_speculative_tokens
 
         # ===========================================================
-        # PC + Spec decode shadow-slot scratch tensor (NemotronH-only fix).
+        # v2 PC + Spec decode: persistent scratch SSM slots.
         #
-        # When prefix caching ('all' mode) AND speculative decoding are
-        # both enabled, the regular ssm_state pool MUST NOT be used as
-        # the kernel's per-token write target — doing so contaminates
-        # boundary states cached by the prefix-cache committer when a
-        # spec verify step crosses a mamba block boundary.
+        # When mamba_cache_mode="all" (PC) AND spec decode is active,
+        # the SSM kernel needs K+1 dedicated candidate slots per request
+        # (for its native init_token_idx rollback). The block table
+        # only has 1 slot per block — wrong for spec decode indexing.
         #
-        # Instead, we allocate a dedicated SCRATCH tensor that is
-        # absolutely segregated from the regular pool: it's a separate
-        # torch.Tensor on the same device, never registered with
-        # BlockPool, never hashed by the radix tree, never visible to
-        # MambaManager. The kernel reads/writes to this scratch tensor
-        # for spec verify, and after the rejection sampler runs we copy
-        # the accepted state back to the canonical block slot in the
-        # regular ssm_state pool.
+        # We allocate a separate scratch SSM tensor with K+1 slots per
+        # request. States persist in scratch across decode steps (no
+        # per-step pool↔scratch round-trip). The pool is only written
+        # at block boundaries (to provide correct boundary states for
+        # the prefix cache).
         #
-        # Memory cost (per layer):
-        #   max_running_seqs * (1 + num_spec) slots * per_slot_size
-        # E.g. for max_num_seqs=16, K=4 spec tokens, fp16 ssm state:
-        #   16 * 5 * 1.5 MB ≈ 120 MB / layer × 31 layers ≈ 3.7 GB total
-        # At fp32 the cost doubles. Allocated lazily on first decode
-        # call so we know the device + dtype + actual ssm_state shape.
-        #
-        # See docs/features/_pc_spec_decode_upstream_status.md for the
-        # full design writeup.
-        self._spec_scratch_enabled = (
+        # Conv state uses the regular pool with IS_APC_ENABLED=True
+        # (the native APC path handles conv correctly for the boundary
+        # writes; spec decode contamination of conv boundary states is
+        # handled by the kernel's built-in widened-state rollback).
+        # ===========================================================
+        self._pc_spec_v2_enabled = (
             self.num_spec > 0
             and self.cache_config is not None
             and self.cache_config.mamba_cache_mode == "all"
         )
         self.spec_scratch_ssm_state: torch.Tensor | None = None
-        self.spec_scratch_conv_state: torch.Tensor | None = None
-        # Per-step pending commit info: tuple of
-        #   (canonical_dst_slot_ids, scratch_slot_base)
-        # populated at the start of each decode-with-spec-PC forward,
-        # consumed by commit_spec_scratch_to_canonical() after the
-        # rejection sampler runs.
-        self._spec_scratch_pending: tuple[torch.Tensor, torch.Tensor] | None = None
-        if self._spec_scratch_enabled:
+        if self._pc_spec_v2_enabled:
             scheduler_config = vllm_config.scheduler_config
-            self._spec_scratch_max_running_seqs = scheduler_config.max_num_seqs
-            self._spec_scratch_slots_per_req = 1 + self.num_spec
-
-            # ONE-TIME startup warning. Log the rough fraction of decode
-            # steps that will fall back to greedy (single-token, no spec)
-            # because they cross a mamba block boundary. With block size B
-            # and K speculative tokens, exactly K+1 consecutive decode
-            # steps per block boundary are unsafe (the window where any of
-            # the K+1 candidate positions could span the boundary). The
-            # disable rate is therefore (K+1) / B.
-            #
-            # Logged at most once per process via a module-level flag —
-            # NemotronH has 31 mamba layers and we'd otherwise spam.
-            global _PC_SPEC_BOUNDARY_WARNED
-            if not _PC_SPEC_BOUNDARY_WARNED:
-                _PC_SPEC_BOUNDARY_WARNED = True
-                B = self.cache_config.mamba_block_size
-                K1 = self._spec_scratch_slots_per_req
-                disable_pct = 100.0 * K1 / B
-                enabled_pct = 100.0 - disable_pct
+            self._pc_spec_max_seqs = scheduler_config.max_num_seqs
+            self._pc_spec_slots_per_req = 1 + self.num_spec
+            global _PC_SPEC_V2_WARNED
+            if not _PC_SPEC_V2_WARNED:
+                _PC_SPEC_V2_WARNED = True
                 logger.warning(
-                    "PC + speculative decoding enabled with "
-                    "mamba_block_size=%d and num_speculative_tokens=%d. "
-                    "Speculative decoding will be active for ~%.2f%% of "
-                    "decode steps; the remaining ~%.2f%% (within K+1=%d "
-                    "steps of each block boundary) will fall back to "
-                    "single-token greedy decoding for correctness. See "
-                    "docs/features/_pc_spec_decode_three_approaches.md "
-                    "for the design rationale.",
-                    B,
+                    "PC + spec decode v2 enabled: using persistent scratch "
+                    "SSM slots with boundary-only commit. K=%d, block_size=%d.",
                     self.num_spec,
-                    enabled_pct,
-                    disable_pct,
-                    K1,
+                    self.cache_config.mamba_block_size,
                 )
 
         # Pre-compute sizes for forward pass
@@ -732,29 +690,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 attn_metadata.block_idx_first_scheduled_token_p
             )
             num_computed_tokens_p = attn_metadata.num_computed_tokens_p
-            # Decode-side block_idx_first_scheduled_token: split out from
-            # the full per-request tensor that the metadata builder added
-            # for the PC + spec decode disable-at-boundary fix. May be None
-            # if the metadata builder didn't populate it (e.g., legacy align
-            # mode); in that case the spec scratch path will not need it
-            # because the safety check (block_idx_last_computed ==
-            # block_idx_last_scheduled) is also computed locally and only
-            # the unsafe branch references first_scheduled.
-            if attn_metadata.block_idx_first_scheduled_token is not None:
-                block_idx_first_scheduled_token_d, _ = torch.split(
-                    attn_metadata.block_idx_first_scheduled_token,
-                    [num_decodes, num_prefills],
-                    dim=0,
-                )
-            else:
-                block_idx_first_scheduled_token_d = None
         else:
             block_idx_last_computed_token_p = None
             block_idx_last_scheduled_token_p = None
             block_idx_first_scheduled_token_p = None
             block_idx_last_scheduled_token_d = None
             block_idx_last_computed_token_d = None
-            block_idx_first_scheduled_token_d = None
             num_computed_tokens_p = None
 
         preallocated_ssm_out_d, preallocated_ssm_out_p = torch.split(
@@ -921,220 +862,63 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
-            # ================================================================
-            # PC + Spec decode shadow-slot scratch path (NemotronH-only fix).
+            # =============================================================
+            # v2 PC + Spec decode path: persistent scratch SSM slots.
             #
-            # When prefix caching is enabled AND speculative decoding is
-            # active, we MUST NOT let the kernel write spec-verify
-            # intermediate states to slots in the regular ssm_state pool —
-            # those slots are committed verbatim to the prefix cache by
-            # the radix-tree committer when blocks become full, and would
-            # contaminate cached boundary states for future requests.
+            # When PC (mamba_cache_mode=all) AND spec decode are both
+            # active, the SSM kernel uses persistent scratch slots with
+            # K+1 candidates per request (native init_token_idx rollback).
+            # The conv kernel uses the regular pool with APC mode.
             #
-            # Instead, route reads/writes through self.spec_scratch_ssm_state
-            # (a pre-allocated tensor that is absolutely segregated from the
-            # regular pool, never visible to BlockPool / MambaManager / the
-            # radix tree). After the rejection sampler runs, the worker
-            # copies the accepted state back to the canonical block slot in
-            # the regular pool — that copy lives in
-            # gpu_model_runner._update_states_after_model_execute and uses
-            # the per-layer commit_spec_scratch_to_canonical helper below.
+            # The scratch slots are NEVER round-tripped to the pool per
+            # step. States persist in scratch across decode steps. Only
+            # at block boundaries (detected post-step in the runner's
+            # commit_boundary_states hook) do we copy the boundary state
+            # from scratch to the pool for the prefix cache.
             #
-            # See docs/features/_pc_spec_decode_upstream_status.md for the
-            # full design writeup.
-            use_spec_scratch_path = (
+            # On the first decode step after prefill (when the scratch
+            # is empty), we initialize scratch[base+0] from the pool.
+            # We detect this by always copying pool → scratch[base+0];
+            # on subsequent steps the kernel reads from base+init_tok_idx
+            # (typically > 0), so the copy to base+0 is a wasted no-op.
+            # =============================================================
+            use_v2_scratch = (
                 is_mamba_cache_all
-                and self._spec_scratch_enabled
+                and self._pc_spec_v2_enabled
                 and num_accepted_tokens is not None
             )
-            if use_spec_scratch_path:
-                # Scratch tensor is eagerly allocated by gpu_model_runner
-                # right after bind_kv_cache (so it lives outside any
-                # cudagraph capture region). If it's still None here we
-                # were skipped — fall through to a NoneType error so
-                # the bug is loud, not silent.
-                assert self.spec_scratch_ssm_state is not None, (
-                    "spec_scratch_ssm_state was not eagerly allocated by "
-                    "gpu_model_runner.initialize_kv_cache_tensors. Check "
-                    "that the post-bind_kv_cache hook is firing for this "
-                    "layer."
-                )
-                assert block_idx_first_scheduled_token_d is not None, (
-                    "block_idx_first_scheduled_token_d is None inside the "
-                    "spec scratch path; the metadata builder did not "
-                    "populate the full block_idx_first_scheduled_token "
-                    "tensor. The disable-at-boundary fix needs it — check "
-                    "mamba_attn.py:_compute_common_metadata."
-                )
-                # ----------------------------------------------------------
-                # Cudagraph-safe path with disable-at-boundary handling.
-                #
-                # Per-request safety check:
-                #   unsafe[req] = block_idx_last_computed_token[req]
-                #               != block_idx_last_scheduled_token[req]
-                # Equivalently: the K+1 candidate positions span a mamba
-                # block boundary, so naively writing K+1 post-states to one
-                # block's slot would corrupt the prefix-cache contract.
-                # Unsafe requests get forced num_accepted=1 in the runner
-                # (so only token 0 is accepted) and only token 0's
-                # post-state is committed, written to the slot for token
-                # 0's block (= block_idx_first_scheduled).
-                #
-                # All tensors used below are SLICES of pre-allocated layer
-                # buffers, sized for max_running_seqs and pre-computed in
-                # _init_spec_scratch_ssm_state. No torch.arange, no
-                # torch.zeros, no .contiguous() copies, no per-call .long()
-                # conversions. The cross-graph-boundary stashed pending
-                # tensors all live in stable storage.
-                #
-                # See docs/features/_pc_spec_decode_three_approaches.md for
-                # the off-by-one analysis.
-                # ----------------------------------------------------------
 
-                # Per-row safety mask, computed into a STABLE pre-allocated
-                # bool buffer (not a fresh allocation) so that:
-                #   (a) the cudagraph capture sees a constant tensor address
-                #   (b) the runner can read this buffer eagerly AFTER the
-                #       captured forward returns to clamp num_accepted to 1
-                #       for unsafe requests (the runner-side
-                #       _update_states_after_model_execute path).
-                unsafe_d_buf = self._spec_scratch_unsafe_mask_bool[:num_decodes]
-                torch.ne(
-                    block_idx_last_computed_token_d,
-                    block_idx_last_scheduled_token_d,
-                    out=unsafe_d_buf,
-                )
-                unsafe_d = unsafe_d_buf
+            if use_v2_scratch:
+                assert self.spec_scratch_ssm_state is not None
 
-                # ===========================================================
-                # 1. Compute the canonical INPUT slot (the slot we read FROM).
-                #    For both safe and unsafe, the input slot is the OLD
-                #    canonical slot at block_idx_last_computed_token. (For
-                #    unsafe case 1, where num_computed_tokens is at a block
-                #    boundary, this is the previous block's boundary state.)
-                # ===========================================================
-                canonical_in_slot_int32_buf = (
-                    self._spec_scratch_canonical_in_slot_int32[:num_decodes]
-                )
-                torch.gather(
-                    state_indices_tensor_d,
-                    1,
-                    block_idx_last_computed_token_d.unsqueeze(1),
-                    out=canonical_in_slot_int32_buf,
-                )
-                canonical_in_slot_long_buf = (
-                    self._spec_scratch_canonical_in_slot_long[:num_decodes]
-                )
-                canonical_in_slot_long_buf.copy_(
-                    canonical_in_slot_int32_buf.squeeze(1)
-                )
+                # Canonical pool slot (for init copy + boundary commit)
+                canonical_in_slot = state_indices_tensor_d.gather(
+                    1, block_idx_last_computed_token_d.unsqueeze(1)
+                ).squeeze(1).long()
 
-                # ===========================================================
-                # 2. Compute the canonical DESTINATION slot (the slot we
-                #    commit BACK TO). For SAFE requests this equals
-                #    canonical_in_slot. For UNSAFE requests this is
-                #    state_indices[req][block_idx_first_scheduled_token[req]]
-                #    — i.e., the slot for token 0's block.
-                #
-                #    Implementation: torch.where to pick the right block
-                #    index per request, then a single gather. Both ops are
-                #    fully tensorized (no Python branches inside the
-                #    captured region).
-                # ===========================================================
-                canonical_dst_block_buf = (
-                    self._spec_scratch_canonical_dst_block_int32[:num_decodes]
-                )
-                torch.where(
-                    unsafe_d,
-                    block_idx_first_scheduled_token_d,
-                    block_idx_last_computed_token_d,
-                    out=canonical_dst_block_buf,
-                )
-                canonical_dst_slot_int32_buf = (
-                    self._spec_scratch_canonical_dst_slot_int32[:num_decodes]
-                )
-                torch.gather(
-                    state_indices_tensor_d,
-                    1,
-                    canonical_dst_block_buf.unsqueeze(1),
-                    out=canonical_dst_slot_int32_buf,
-                )
-                canonical_dst_slot_long_buf = (
-                    self._spec_scratch_canonical_dst_slot_long[:num_decodes]
-                )
-                canonical_dst_slot_long_buf.copy_(
-                    canonical_dst_slot_int32_buf.squeeze(1)
-                )
-
-                # ===========================================================
-                # 3. Per-batch-position scratch slot base IDs (constant
-                #    pre-computed buffers). Long form is used as the index
-                #    arg to index_copy_ below.
-                # ===========================================================
-                scratch_slot_base_long = (
-                    self._spec_scratch_slot_base_long[:num_decodes]
-                )
-
-                # ===========================================================
-                # 4. Pre-step copy: ssm_state[canonical_in_slot] →
-                #    scratch[scratch_slot_base + 0].
-                #    The kernel reads from scratch_slot_base + init_token_idx
-                #    (where init_token_idx comes from num_accepted of the
-                #    previous step). Because state_indices_tensor_d_input is
-                #    set to scratch_slot_base broadcast across all K+1
-                #    columns, the kernel always reads from the +0 entry.
-                # ===========================================================
+                # Init copy: pool[canonical] → scratch[base+0]
+                slot_base_long = self._pc_spec_slot_base_long[:num_decodes]
                 self.spec_scratch_ssm_state.index_copy_(
                     0,
-                    scratch_slot_base_long,
-                    ssm_state.index_select(0, canonical_in_slot_long_buf),
+                    slot_base_long,
+                    ssm_state.index_select(0, canonical_in_slot),
                 )
 
-                # ===========================================================
-                # 5. Stash for the worker's post-verify commit.
-                #    The first entry is the DESTINATION slot (per request),
-                #    the second is the source slot base (per request). Both
-                #    are LONG-typed slices of layer-attribute buffers, so
-                #    the storage is stable across the
-                #    captured-forward → eager-commit boundary.
-                # ===========================================================
-                self._spec_scratch_pending = (
-                    canonical_dst_slot_long_buf,
-                    scratch_slot_base_long,
-                )
-
-                # ===========================================================
-                # 6. Pre-computed kernel state indices.
-                #    Input: all K+1 entries point to scratch_slot_base + 0.
-                #    Output: per request, either
-                #      [base+0, base+1, ..., base+K]   (safe)
-                #    or
-                #      [base+0, NULL,   ..., NULL  ]   (unsafe — kernel
-                #                                       skips writes for
-                #                                       NULL_BLOCK_ID slots)
-                #    Combined via torch.where row-wise.
-                # ===========================================================
+                # SSM kernel uses K+1 scratch slot IDs (native rollback)
                 state_indices_tensor_d_input = (
-                    self._spec_scratch_state_indices_input_int32[:num_decodes]
+                    self._pc_spec_slot_ids_int32[:num_decodes]
                 )
-                output_combined_buf = (
-                    self._spec_scratch_state_indices_output_combined_int32[
-                        :num_decodes
-                    ]
+                state_indices_tensor_d_output = (
+                    self._pc_spec_slot_ids_int32[:num_decodes]
                 )
-                torch.where(
-                    unsafe_d.unsqueeze(1),
-                    self._spec_scratch_state_indices_unsafe_output_int32[
-                        :num_decodes
-                    ],
-                    self._spec_scratch_state_indices_output_int32[:num_decodes],
-                    out=output_combined_buf,
-                )
-                state_indices_tensor_d_output = output_combined_buf
-
-                # Use the scratch tensor as the "ssm_state" for the kernel
-                # call below.
                 ssm_state_for_kernel = self.spec_scratch_ssm_state
+
+                # Stash for boundary commit (block table + old block idx)
+                self._pc_spec_pending = (
+                    state_indices_tensor_d,
+                    block_idx_last_computed_token_d,
+                )
+
             elif is_mamba_cache_all:
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
                     1, block_idx_last_computed_token_d.unsqueeze(1)
@@ -1142,12 +926,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_output = state_indices_tensor_d.gather(
                     1, block_idx_last_scheduled_token_d.unsqueeze(1)
                 ).squeeze(1)
-                # for decode:
-                #   block_idx_first_scheduled_token_d ==
-                #       block_idx_last_scheduled_token_d
-                # at block boundaries:
-                #   block_idx_first_scheduled_token_d >
-                #       block_idx_last_computed_token_d
                 ssm_state_for_kernel = ssm_state
             else:
                 # Without caching, read and write in-place to the same blocks:
@@ -1156,18 +934,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 ssm_state_for_kernel = ssm_state
 
             # 2. Convolution sequence transformation
-            # When the spec scratch path is active, route conv_state
-            # through the scratch tensor too: pre-copy canonical →
-            # scratch, run the kernel with scratch (non-APC mode so the
-            # widened state + num_accepted offset logic handles per-
-            # candidate rollback), then commit in the post-step hook.
-            # Conv state: use the regular pool directly (no scratch).
-            # With prefix cache hits at 0% (upstream issue #38182),
-            # contamination of cached conv boundary states doesn't
-            # matter — nobody reads them. This eliminates the conv
-            # round-trip (pool→scratch→pool) which was suspected of
-            # causing the accuracy degradation from 92% → 50%.
-            # The SSM state still uses scratch (needed for K+1 slots).
+            # Conv always uses the regular pool + APC mode (no scratch).
             hidden_states_B_C_d = causal_conv1d_update(
                 hidden_states_B_C_d,
                 conv_state,
@@ -1175,9 +942,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=state_indices_tensor_d,
-                block_idx_last_scheduled_token=(
-                    block_idx_last_scheduled_token_d
-                ),
+                block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
                 initial_state_idx=block_idx_last_computed_token_d,
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
@@ -1206,9 +971,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             assert preallocated_ssm_out_d is not None
             # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - When use_spec_scratch_path is True, ssm_state_for_kernel is
-            #   self.spec_scratch_ssm_state and the slot indices point into
-            #   it. Otherwise it's the regular ssm_state.
+            # - When use_v2_scratch is True, ssm_state_for_kernel is
+            #   the scratch tensor and indices point to scratch slots.
+            #   Otherwise it's the regular pool.
             # NOTE: final output is an in-place update of out tensor
             selective_state_update(
                 ssm_state_for_kernel,
@@ -1231,52 +996,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 cache_philox_rounds=self.cache_config.mamba_cache_philox_rounds,
             )
 
-    def _init_spec_scratch_states(
-        self,
-        conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
-    ) -> None:
-        """Eagerly allocate spec-decode scratch tensors for BOTH conv_state
-        and ssm_state, plus the shared per-step index buffers.
+    def _init_pc_spec_v2_scratch(self, ssm_state: torch.Tensor) -> None:
+        """Allocate the persistent scratch SSM tensor for v2 PC+spec.
 
-        Called from gpu_model_runner.initialize_kv_cache_tensors right after
-        bind_kv_cache, BEFORE any cudagraph capture has started. This is
-        load-bearing: every tensor allocated here must live in the main
-        allocator pool (not the cudagraph private pool) so that storage
-        addresses are stable across cudagraph captures and replays.
-
-        Both conv_state and ssm_state share the same page in the regular
-        mamba pool (stride[0] = page_size_bytes / dtype_size). The scratch
-        tensors match this stride so that index_copy_ / index_select between
-        scratch and the regular pool preserve the per-slot data layout.
-
-        The conv_state scratch is essential because the causal_conv1d kernel
-        (in IS_APC_ENABLED mode) writes the FULL widened conv state — which
-        includes speculative candidate inputs — directly to the block's
-        canonical slot. Without the scratch, those speculative writes
-        contaminate the prefix cache's boundary snapshot and corrupt future
-        requests that hit the cache.
+        Called from gpu_model_runner.initialize_kv_cache_tensors after
+        bind_kv_cache, BEFORE any cudagraph capture. The scratch tensor
+        matches the pool's stride so index_copy_ works correctly.
         """
-        assert self._spec_scratch_enabled
+        M = self._pc_spec_max_seqs
+        K1 = self._pc_spec_slots_per_req
+        # +1 for NULL_BLOCK_ID sentinel at slot 0
+        total_slots = M * K1 + 1
+
         per_slot_shape = ssm_state.shape[1:]
-        # +1 for the unused slot 0 (NULL_BLOCK_ID sentinel — the kernel
-        # silently skips reads/writes to slot 0). See the +1 offset in
-        # the scratch_slot_base computation in conv_ssm_forward.
-        total_slots = (
-            self._spec_scratch_max_running_seqs * self._spec_scratch_slots_per_req
-            + 1
-        )
-        # Allocate via raw bytes so we can match the strided layout exactly.
-        # The ssm_state stride[0] in elements gives us the page size.
         page_size_elements = ssm_state.stride(0)
-        # Compute inner strides from the per_slot_shape (contiguous within
-        # a slot — only the leading slot dim has the page-padded stride).
         inner_stride = torch.empty(per_slot_shape).stride()
         target_stride = (page_size_elements, *inner_stride)
-        # Total raw element count = total_slots * page_size_elements
-        # (this includes the per-slot padding region between
-        # consecutive slots, which is wasted but lets us share strides
-        # with the regular pool).
         raw = torch.zeros(
             total_slots * page_size_elements,
             dtype=ssm_state.dtype,
@@ -1289,244 +1024,90 @@ class MambaMixer2(MambaBase, PluggableLayer):
             storage_offset=0,
         )
 
-        # ===========================================================
-        # Conv state scratch (same segregation principle as SSM state).
-        # The conv_state in the regular pool has shape
-        #   (num_blocks, conv_dim, state_len)
-        # where state_len = conv_kernel - 1 + num_spec (widened for spec).
-        #
-        # IMPORTANT: we use CONTIGUOUS allocation for conv scratch
-        # (NOT the page-padded stride used by the regular pool). The
-        # page padding is huge (~2.3MB/slot for NemotronH) because it's
-        # shared with the SSM state segment, but the conv data is only
-        # ~196KB/slot. Page-padded scratch would waste ~5.8GB across 31
-        # layers, causing OOM. Contiguous scratch is ~481MB total.
-        #
-        # PyTorch's index_copy_ / index_select handle the stride
-        # mismatch between page-padded pool and contiguous scratch
-        # correctly: they copy element-by-element, not raw bytes.
-        # ===========================================================
-        conv_per_slot_shape = conv_state.shape[1:]
-        self.spec_scratch_conv_state = torch.zeros(
-            (total_slots, *conv_per_slot_shape),
-            dtype=conv_state.dtype,
-            device=conv_state.device,
-        )
-
-        # ===========================================================
-        # Pre-allocated, persistent per-step index buffers.
-        #
-        # These are sized for the worst-case batch (max_running_seqs)
-        # and the forward path slices into them via [:num_decodes]
-        # instead of allocating fresh tensors per call. The point is
-        # cudagraph compatibility: every replay must reuse the same
-        # storage addresses, otherwise we risk capturing stale pointers
-        # into freed memory and getting silent corruption (the symptom
-        # we observed in the cudagraph-mode AIME-25 regression where
-        # accuracy collapsed from ~95% eager → ~74% cudagraph).
-        #
-        # All buffers live on the same device/stream as ssm_state.
-        # ===========================================================
+        # Pre-computed slot index table: shape (M, K+1) int32.
+        # spec_slot_ids[i][j] = 1 + i * K1 + j (skip slot 0 for NULL)
         device = ssm_state.device
-        M = self._spec_scratch_max_running_seqs
-        K1 = self._spec_scratch_slots_per_req
-
-        # arange(M) — used as the row index for "request i in the running
-        # batch". Pre-allocated as int32 because state_indices_tensor_d
-        # is int32 in vLLM's attention metadata.
-        req_batch_indices = torch.arange(M, device=device, dtype=torch.int32)
-        # 1 + arange(M) * (K+1) — the +1 reserves slot 0 for NULL_BLOCK_ID
-        # (the kernel skips reads/writes to slot 0; see the long comment in
-        # conv_ssm_forward where this used to be computed per-call).
-        self._spec_scratch_slot_base_int32 = (
-            1 + req_batch_indices * K1
-        ).contiguous()
-        # Long-typed view of slot_base (used as the dim-0 index argument
-        # to index_copy_ / index_select inside the forward and the commit
-        # helper). Materializing it once avoids per-call .long() copies.
-        self._spec_scratch_slot_base_long = (
-            self._spec_scratch_slot_base_int32.long().contiguous()
-        )
-
-        # state_indices_input[i, j] = slot_base[i] (broadcast over j).
-        # The kernel reads the input state from this slot for every
-        # candidate token j ∈ [0, K]. Shape (M, K+1), int32.
-        self._spec_scratch_state_indices_input_int32 = (
-            self._spec_scratch_slot_base_int32.unsqueeze(1)
-            .expand(-1, K1)
-            .contiguous()
-        )
-
-        # state_indices_output[i, j] = slot_base[i] + j. Shape (M, K+1),
-        # int32. The kernel writes the post-token-j state to this slot.
+        bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * K1
         offsets = torch.arange(K1, device=device, dtype=torch.int32)
-        self._spec_scratch_state_indices_output_int32 = (
-            self._spec_scratch_slot_base_int32.unsqueeze(1) + offsets.unsqueeze(0)
+        self._pc_spec_slot_ids_int32 = (
+            bases.unsqueeze(1) + offsets.unsqueeze(0)
         ).contiguous()
+        # Long version for index_copy_/index_select
+        self._pc_spec_slot_base_long = bases.long().contiguous()
 
-        # state_indices_output for boundary-crossing ("unsafe") requests:
-        # only token 0 gets a real scratch slot; tokens 1..K get
-        # NULL_BLOCK_ID so the kernel SKIPS those writes (see
-        # mamba_ssm.py:260 — `if token_dst_idx != null_block_id`).
-        # We don't want speculative junk written to ANY slot for unsafe
-        # requests, because we'll force num_accepted=1 in the runner and
-        # only commit token 0's post-state to the canonical pool.
-        # Shape (M, K+1), int32. Constant; computed once at startup.
-        unsafe_output = torch.zeros(
-            (M, K1), device=device, dtype=torch.int32
-        )  # NULL_BLOCK_ID == 0 everywhere
-        unsafe_output[:, 0] = self._spec_scratch_slot_base_int32  # token 0 → base
-        self._spec_scratch_state_indices_unsafe_output_int32 = (
-            unsafe_output.contiguous()
-        )
-
-        # Buffers to receive the per-call canonical "current"-slot ids that
-        # we gather out of state_indices_tensor_d. We need both an int32
-        # form (because state_indices_tensor_d is int32 and gather's `out=`
-        # tensor must match dtype) and a long form (because index_select /
-        # index_copy_ require int64 indices). Pre-allocated to keep storage
-        # stable across cudagraph replays.
-        #   shape (M, 1) — matches gather output (index has unsqueeze(1))
-        self._spec_scratch_canonical_in_slot_int32 = torch.empty(
-            (M, 1), device=device, dtype=torch.int32
-        )
-        #   shape (M,) — long form for use as an index_select / index_copy_ arg
-        self._spec_scratch_canonical_in_slot_long = torch.empty(
-            (M,), device=device, dtype=torch.long
-        )
-
-        # Parallel buffers for the per-call canonical DESTINATION slot ids:
-        # the slot we commit token 0's (or token N-1's) post-state TO. For
-        # SAFE requests this equals canonical_in_slot — the OLD slot stays
-        # live. For UNSAFE (boundary-crossing) requests this is
-        # state_indices_tensor_d gathered at block_idx_first_scheduled,
-        # i.e., the slot for token 0's block. The long version is what gets
-        # stashed into _spec_scratch_pending and read by the commit hook
-        # outside the cudagraph capture region — it MUST live in stable
-        # storage (this layer attribute), not in some fresh per-call tensor
-        # whose backing memory could be reused across cudagraph replays.
-        self._spec_scratch_canonical_dst_slot_int32 = torch.empty(
-            (M, 1), device=device, dtype=torch.int32
-        )
-        self._spec_scratch_canonical_dst_slot_long = torch.empty(
-            (M,), device=device, dtype=torch.long
-        )
-
-        # Buffer for the per-call combined state_indices_tensor_d_output
-        # (the result of torch.where mixing safe vs unsafe per-row).
-        # Pre-allocated so the kernel input has stable storage. Shape
-        # matches both input buffers: (M, K+1), int32.
-        self._spec_scratch_state_indices_output_combined_int32 = torch.empty(
-            (M, K1), device=device, dtype=torch.int32
-        )
-
-        # Buffer for the per-row "destination block index" used as the
-        # gather argument when computing canonical_dst_slot. For each row:
-        #   safe[req]   → block_idx_last_computed_token[req]
-        #   unsafe[req] → block_idx_first_scheduled_token[req]
-        # The block-index gather argument has to be int32 (matches
-        # state_indices_tensor_d.dtype) to satisfy gather's index dtype
-        # constraint.
-        self._spec_scratch_canonical_dst_block_int32 = torch.empty(
-            (M,), device=device, dtype=torch.int32
-        )
-
-        # Per-row "is this request boundary-crossing?" mask. Computed by
-        # the layer's forward (inside the captured cudagraph region) using
-        # torch.ne(..., out=...) into this stable buffer. The runner reads
-        # it back AFTER the captured forward to clamp num_accepted_tokens
-        # to 1 for unsafe requests (so commit_spec_scratch_to_canonical
-        # picks scratch_slot_base + 0 instead of scratch_slot_base + N - 1,
-        # AND so the runner emits exactly 1 output token for those reqs).
-        # All mamba layers see the same metadata so the runner only needs
-        # to read this buffer from ONE layer per step. Shape (M,) bool.
-        self._spec_scratch_unsafe_mask_bool = torch.empty(
-            (M,), device=device, dtype=torch.bool
-        )
-
-        # Long buffer for the per-step "scratch source slot" indices used
-        # by commit_spec_scratch_to_canonical:
-        #   src_idx[i] = scratch_slot_base[i] + num_accepted[i] - 1
-        # This runs outside cudagraph (in
-        # gpu_model_runner._update_states_after_model_execute) so the
-        # cudagraph-stability argument doesn't apply, but pre-allocating
-        # still avoids allocator churn on the hot path. Shape (M,) long.
-        self._spec_scratch_src_indices_long = torch.empty(
-            (M,), device=device, dtype=torch.long
-        )
-
-    def commit_spec_scratch_to_canonical(
+    def commit_boundary_states(
         self,
         num_accepted_tokens: torch.Tensor,
+        num_computed_tokens_d: torch.Tensor,
+        block_size: int,
     ) -> None:
-        """Copy accepted spec scratch slots back to the canonical pool.
+        """Commit SSM boundary states to the pool for prefix cache.
 
-        Called by the worker (gpu_model_runner) after the rejection sampler
-        determines per-request accept counts AND after the runner has
-        already clamped num_accepted_tokens to 1 for boundary-crossing
-        ("unsafe") requests. See the disable-at-boundary fix in
-        gpu_model_runner._update_states_after_model_execute and
-        docs/features/_pc_spec_decode_three_approaches.md option 1.
-
-        Uses the per-step pending info stashed in self._spec_scratch_pending
-        by the most recent forward() call. If no spec-scratch path was
-        taken (e.g. this layer is in a prefill-only step), this is a no-op.
-
-        This MUST run before the scheduler's cache_blocks() commits any
-        block to the prefix cache, otherwise the cache committer will read
-        the stale (pre-step) state from the canonical slot. The worker is
-        responsible for ordering this correctly.
+        Called from gpu_model_runner after the rejection sampler. For
+        each request whose accepted tokens span a block boundary, copy
+        the boundary-position state from scratch to the pool.
 
         Args:
-            num_accepted_tokens: int32 tensor (num_decodes,) of accepted
-                token counts. For safe requests this is the rejection
-                sampler's output (in [1, K+1]). For unsafe requests it has
-                been clamped to 1 by the runner. Either way, the slot
-                committed is `scratch_slot_base + num_accepted - 1`, and
-                the canonical destination slot was pre-computed per
-                request inside the forward pass (so unsafe requests
-                commit to the FIRST scheduled block's slot, not the OLD
-                canonical slot).
+            num_accepted_tokens: (num_decodes,) int32 — accepted count
+            num_computed_tokens_d: (num_decodes,) int32 — position before
+                this step (= n_done for each request)
+            block_size: mamba block size (e.g. 512)
         """
-        if not self._spec_scratch_enabled:
+        if not self._pc_spec_v2_enabled or self.spec_scratch_ssm_state is None:
             return
-        if self._spec_scratch_pending is None:
-            # No spec-scratch path was taken this step (e.g. prefill-only)
-            return
-        # Both entries in _spec_scratch_pending are pre-allocated long-typed
-        # SLICES of layer-attribute buffers (see _init_spec_scratch_ssm_state).
-        # No .long() conversion needed.
-        canonical_dst_long, scratch_slot_base_long = self._spec_scratch_pending
-        num_decodes = canonical_dst_long.shape[0]
 
-        # src_idx[i] = scratch_slot_base[i] + num_accepted[i] - 1
-        # This is the slot containing the state after the i-th request's
-        # last accepted token of this step's spec verify. We materialize
-        # the result in a pre-allocated long buffer (_spec_scratch_src_indices_long)
-        # to avoid per-call allocations.
-        src_idx_long = self._spec_scratch_src_indices_long[:num_decodes]
-        # Compute into the buffer in-place: copy_ accepts a broadcasted
-        # arithmetic expression and handles the int32→int64 cast.
-        src_idx_long.copy_(
-            scratch_slot_base_long + num_accepted_tokens[:num_decodes] - 1
-        )
-
-        assert self.spec_scratch_ssm_state is not None
         ssm_state = self.kv_cache[1]
-        # Use index_copy_ instead of fancy-indexed assignment so the dst
-        # dim is explicit and no fancy-indexing semantics ambiguity.
+        num_decodes = num_accepted_tokens.shape[0]
+
+        n_done = num_computed_tokens_d[:num_decodes]
+        n_accepted = num_accepted_tokens[:num_decodes]
+
+        # Block index before and after this step
+        block_before = (n_done - 1).clamp(min=0) // block_size
+        block_after = (n_done + n_accepted - 1) // block_size
+
+        # Requests that crossed a boundary
+        crossed = (block_before != block_after)
+        if not crossed.any():
+            return
+
+        # For each crossing request: the boundary position is
+        # (block_before + 1) * block_size - 1 = last position of old block.
+        # The candidate index for this position is:
+        # j = boundary_pos - n_done
+        boundary_pos = (block_before + 1) * block_size - 1
+        candidate_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
+
+        # Scratch slot for the boundary state
+        slot_base = self._pc_spec_slot_base_long[:num_decodes]
+        scratch_slot = (slot_base + candidate_idx.long())
+
+        # Pool slot for the old block (from block table)
+        # We need the block table to look up the physical slot.
+        # The block table is state_indices_tensor_d from the metadata.
+        # We stash it in _pc_spec_pending during forward.
+        if not hasattr(self, '_pc_spec_pending') or self._pc_spec_pending is None:
+            return
+        state_indices_tensor_d, block_idx_old = self._pc_spec_pending
+
+        pool_slot = state_indices_tensor_d.gather(
+            1, block_idx_old.unsqueeze(1)
+        ).squeeze(1).long()
+
+        # Only commit for crossing requests
+        cross_indices = crossed.nonzero(as_tuple=True)[0]
+        if cross_indices.numel() == 0:
+            return
+
+        scratch_src = scratch_slot[cross_indices]
+        pool_dst = pool_slot[cross_indices]
+
         ssm_state.index_copy_(
             0,
-            canonical_dst_long,
-            self.spec_scratch_ssm_state.index_select(0, src_idx_long),
+            pool_dst,
+            self.spec_scratch_ssm_state.index_select(0, scratch_src),
         )
-
-        # Conv state: NO scratch commit needed. Conv state goes directly
-        # through the regular pool (no scratch round-trip). See the
-        # comment in the forward path above the causal_conv1d_update call.
-
-        # Clear the pending so a subsequent call (or a no-spec step) is a no-op
-        self._spec_scratch_pending = None
+        self._pc_spec_pending = None
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None

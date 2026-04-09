@@ -55,18 +55,6 @@ class BaseMambaAttentionMetadata:
     block_idx_last_scheduled_token: torch.Tensor | None
     block_idx_first_scheduled_token_p: torch.Tensor | None
     block_idx_last_computed_token: torch.Tensor | None
-    # Full per-request tensor (decodes + prefills); the layer splits it via
-    # torch.split([num_decodes, num_prefills]) the same way it does for
-    # block_idx_last_computed_token. Required by the PC + spec decode
-    # disable-at-boundary fix in mamba_mixer2.py — we need to know the
-    # block of the FIRST candidate (token 0) per decode request, which is
-    # the destination block when we force num_accepted=1 for boundary-
-    # crossing requests. For non-PC modes this is None.
-    #
-    # NOTE: no default value here on purpose — `seq_lens` (the next field)
-    # has no default, and dataclass inheritance requires all
-    # default-having fields to come after all required fields.
-    block_idx_first_scheduled_token: torch.Tensor | None
 
     # The following tensor is only used for prefix caching in align mode
     seq_lens: torch.Tensor
@@ -140,16 +128,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 device=device,
             )
             self.block_idx_last_computed_token: torch.Tensor = torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.int32,
-                device=device,
-            )
-            # Persistent cudagraph buffer for the per-request "block index of
-            # the FIRST scheduled token" (= block_of(num_computed_tokens)).
-            # Used by the PC+spec disable-at-boundary fix in mamba_mixer2.py;
-            # see _pc_spec_decode_three_approaches.md option 1 for the
-            # off-by-one rationale.
-            self.block_idx_first_scheduled_token: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
                 dtype=torch.int32,
                 device=device,
@@ -492,7 +470,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             block_idx_first_scheduled_token_p=block_idx_first_scheduled_token_p,
-            block_idx_first_scheduled_token=block_idx_first_scheduled_token,
             block_idx_last_computed_token=block_idx_last_computed_token,
             num_computed_tokens_p=num_computed_tokens_p,
             num_reqs=num_reqs,
@@ -517,7 +494,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         num_accepted_tokens = metadata.num_accepted_tokens
         block_idx_last_scheduled_token = metadata.block_idx_last_scheduled_token
         block_idx_last_computed_token = metadata.block_idx_last_computed_token
-        block_idx_first_scheduled_token = metadata.block_idx_first_scheduled_token
         if (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -560,31 +536,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     : metadata.num_decode_tokens
                 ]
 
-                # Copy block_idx_first_scheduled_token into its persistent
-                # cudagraph buffer. Only meaningful when this layer was
-                # populated by _compute_prefix_caching_block_indices (i.e.,
-                # mamba_cache_mode == "all"); skip the copy if the source
-                # is None (e.g., legacy align mode that doesn't compute it).
-                #
-                # Note: we slice by `:num_decodes` here (NOT num_decode_tokens
-                # like the upstream lines for block_idx_last_*). For spec
-                # decode, num_decode_tokens = num_decodes * (K+1), which
-                # would over-slice this per-request buffer. The downstream
-                # consumer (mamba_mixer2.py:conv_ssm_forward) does
-                # torch.split([num_decodes, num_prefills], dim=0), which
-                # expects exactly num_reqs == num_decodes entries (in
-                # cudagraph mode num_prefills is always 0).
-                if block_idx_first_scheduled_token is not None:
-                    self.block_idx_first_scheduled_token[
-                        : metadata.num_decodes
-                    ].copy_(
-                        block_idx_first_scheduled_token[: metadata.num_decodes],
-                        non_blocking=True,
-                    )
-                    block_idx_first_scheduled_token = (
-                        self.block_idx_first_scheduled_token[: metadata.num_decodes]
-                    )
-
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
@@ -592,7 +543,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             num_accepted_tokens=num_accepted_tokens,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             block_idx_last_computed_token=block_idx_last_computed_token,
-            block_idx_first_scheduled_token=block_idx_first_scheduled_token,
         )
 
     def update_block_table(
