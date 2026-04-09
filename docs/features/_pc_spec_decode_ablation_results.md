@@ -7,13 +7,16 @@
 ## TL;DR
 
 - **No-PC + Eagle3 (K=4)**: 92-96% accuracy. Works perfectly.
-- **PC + Eagle3 with our scratch fix**: ~50% accuracy. Degraded.
-- **The degradation is NOT from state corruption** — single-request short
-  generations are perfect. The model just fails to solve hard problems.
+- **PC + Eagle3 with full round-trip (SSM+conv scratch)**: ~50% accuracy.
+- **PC + Eagle3 with SSM-only scratch (Idea 1)**: **76.7% majority vote**.
+  Removing the conv round-trip was a huge win.
+- **The per-step round-trip** (pool → scratch → pool) is the root cause
+  of the accuracy degradation. Removing the conv round-trip recovered
+  ~17pp. Removing the SSM round-trip should close the remaining gap.
 - **Prefix cache hits are 0%** when spec decode is enabled (upstream
-  issues #38182, #31920). This is the biggest performance problem.
-- **The per-step round-trip** (pool → scratch → pool) for mamba states
-  is the most likely remaining correctness issue.
+  issues #38182, #31920). Separate fix needed for block hash.
+- **v2 design (branch `pc-spec-v2-nonpc-slots`)**: use non-PC-style
+  K+1 slots with native kernel rollback, no round-trip.
 
 ## Hardware & model
 
@@ -60,6 +63,7 @@ mamba_cache_mode=all interaction.
 | SSM scratch + boundary disable (eager) | 60 | 48.3% | 53.3% | First full AIME run |
 | SSM scratch + boundary disable (cudagraph) | 60 | 53.3% | 60.0% | Cudagraph mode |
 | SSM+conv scratch + boundary disable | 60 | 50.0% | 60.0% | Conv scratch didn't help |
+| **SSM scratch + native conv (Idea 1)** | **60** | **63.3%** | **76.7%** | **BEST: conv round-trip removed** |
 
 ### No-tool single-turn tests (isolating batching vs multi-turn)
 
