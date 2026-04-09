@@ -532,6 +532,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             and self.cache_config.mamba_cache_mode == "all"
         )
         self.spec_scratch_ssm_state: torch.Tensor | None = None
+        self.spec_scratch_conv_state: torch.Tensor | None = None
         # Per-step pending commit info: tuple of
         #   (canonical_dst_slot_ids, scratch_slot_base)
         # populated at the start of each decode-with-spec-PC forward,
@@ -1155,22 +1156,72 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 ssm_state_for_kernel = ssm_state
 
             # 2. Convolution sequence transformation
-            # NOTE: conv1d state is widened in the inner state_len dim by
-            # num_spec (mamba_utils.py:174), so it stays in the regular
-            # conv_state pool — only the SSM state needs scratch redirection.
-            hidden_states_B_C_d = causal_conv1d_update(
-                hidden_states_B_C_d,
-                conv_state,
-                self.conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=state_indices_tensor_d,
-                block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
-                initial_state_idx=block_idx_last_computed_token_d,
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=query_start_loc_d,
-                max_query_len=state_indices_tensor_d.size(-1),
-            )
+            # When the spec scratch path is active, route conv_state
+            # through the scratch tensor too: pre-copy canonical →
+            # scratch, run the kernel with scratch (non-APC mode so the
+            # widened state + num_accepted offset logic handles per-
+            # candidate rollback), then commit in the post-step hook.
+            if use_spec_scratch_path:
+                assert self.spec_scratch_conv_state is not None
+                # Apply the same layout transpose to the scratch as the
+                # regular pool. The scratch was allocated from kv_cache[0]
+                # (raw SD layout); the kernel expects DS layout (same as
+                # the `conv_state` variable above). transpose(-1, -2) is
+                # a zero-copy view so no extra memory.
+                conv_scratch_view = (
+                    self.spec_scratch_conv_state
+                    if is_conv_state_dim_first()
+                    else self.spec_scratch_conv_state.transpose(-1, -2)
+                )
+                # Pre-copy conv_state[canonical_in_slot] → scratch[base]
+                conv_scratch_view.index_copy_(
+                    0,
+                    scratch_slot_base_long,
+                    conv_state.index_select(
+                        0, canonical_in_slot_long_buf
+                    ),
+                )
+                # Build 1-column conv_state_indices pointing at scratch
+                # base slots. The causal_conv1d_update kernel in non-APC
+                # mode (block_idx_last_scheduled_token=None) uses column
+                # 0 for both read and write. Shape (num_decodes, 1).
+                conv_scratch_indices = (
+                    self._spec_scratch_slot_base_int32[:num_decodes]
+                    .unsqueeze(1)
+                )
+                hidden_states_B_C_d = causal_conv1d_update(
+                    hidden_states_B_C_d,
+                    conv_scratch_view,
+                    self.conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=conv_scratch_indices,
+                    # Pass None for APC args → IS_APC_ENABLED=False in
+                    # the kernel. This makes the kernel use the non-PC
+                    # spec decode path (widened state + conv_state_token_
+                    # offset from num_accepted_tokens).
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=conv_scratch_indices.size(-1),
+                )
+            else:
+                hidden_states_B_C_d = causal_conv1d_update(
+                    hidden_states_B_C_d,
+                    conv_state,
+                    self.conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=state_indices_tensor_d,
+                    block_idx_last_scheduled_token=(
+                        block_idx_last_scheduled_token_d
+                    ),
+                    initial_state_idx=block_idx_last_computed_token_d,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=state_indices_tensor_d.size(-1),
+                )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
@@ -1219,8 +1270,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 cache_philox_rounds=self.cache_config.mamba_cache_philox_rounds,
             )
 
-    def _init_spec_scratch_ssm_state(self, ssm_state: torch.Tensor) -> None:
-        """Eagerly allocate the spec-decode scratch SSM state + index buffers.
+    def _init_spec_scratch_states(
+        self,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> None:
+        """Eagerly allocate spec-decode scratch tensors for BOTH conv_state
+        and ssm_state, plus the shared per-step index buffers.
 
         Called from gpu_model_runner.initialize_kv_cache_tensors right after
         bind_kv_cache, BEFORE any cudagraph capture has started. This is
@@ -1228,30 +1284,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
         allocator pool (not the cudagraph private pool) so that storage
         addresses are stable across cudagraph captures and replays.
 
-        Allocates two groups of tensors:
+        Both conv_state and ssm_state share the same page in the regular
+        mamba pool (stride[0] = page_size_bytes / dtype_size). The scratch
+        tensors match this stride so that index_copy_ / index_select between
+        scratch and the regular pool preserve the per-slot data layout.
 
-        1. spec_scratch_ssm_state — the segregated scratch SSM state pool
-           that is absolutely never visible to the BlockPool / radix cache.
-           Shape (max_running_seqs * (1 + num_spec) + 1, *per_slot_shape).
-           The +1 reserves slot 0 for NULL_BLOCK_ID (the kernel silently
-           skips reads/writes to slot 0).
-
-           IMPORTANT: vLLM's mamba pool ssm_state is created via
-           torch.as_strided with stride[0] = num_element_per_page, where
-           num_element_per_page is the SHARED page size for the entire mamba
-           state (conv_state + ssm_state share a page). This means ssm_state's
-           stride(0) is LARGER than the standard contiguous stride if there's
-           padding. We allocate the scratch tensor with the same stride(0)
-           so that copies between scratch and ssm_state preserve the per-slot
-           data layout.
-
-        2. Persistent per-step index buffers (slot_base, state_indices,
-           canonical_in_slot, src_indices) sized for the worst-case batch
-           (max_running_seqs). The forward path slices into these via
-           [:num_decodes] instead of allocating fresh tensors per call. This
-           is the fix for the cudagraph mode AIME-25 regression where
-           per-call allocations inside the captured region produced stale
-           pending references across replays.
+        The conv_state scratch is essential because the causal_conv1d kernel
+        (in IS_APC_ENABLED mode) writes the FULL widened conv state — which
+        includes speculative candidate inputs — directly to the block's
+        canonical slot. Without the scratch, those speculative writes
+        contaminate the prefix cache's boundary snapshot and corrupt future
+        requests that hit the cache.
         """
         assert self._spec_scratch_enabled
         per_slot_shape = ssm_state.shape[1:]
@@ -1282,6 +1325,30 @@ class MambaMixer2(MambaBase, PluggableLayer):
             raw,
             size=(total_slots, *per_slot_shape),
             stride=target_stride,
+            storage_offset=0,
+        )
+
+        # ===========================================================
+        # Conv state scratch (same segregation principle as SSM state).
+        # The conv_state in the regular pool has shape
+        #   (num_blocks, conv_dim, state_len)
+        # where state_len = conv_kernel - 1 + num_spec (widened for spec).
+        # We use the same stride[0] = page_size_elements / conv_dtype_size
+        # so that index_copy_ between scratch and the pool works.
+        # ===========================================================
+        conv_per_slot_shape = conv_state.shape[1:]
+        conv_page_size_elements = conv_state.stride(0)
+        conv_inner_stride = torch.empty(conv_per_slot_shape).stride()
+        conv_target_stride = (conv_page_size_elements, *conv_inner_stride)
+        conv_raw = torch.zeros(
+            total_slots * conv_page_size_elements,
+            dtype=conv_state.dtype,
+            device=conv_state.device,
+        )
+        self.spec_scratch_conv_state = torch.as_strided(
+            conv_raw,
+            size=(total_slots, *conv_per_slot_shape),
+            stride=conv_target_stride,
             storage_offset=0,
         )
 
@@ -1492,6 +1559,25 @@ class MambaMixer2(MambaBase, PluggableLayer):
             canonical_dst_long,
             self.spec_scratch_ssm_state.index_select(0, src_idx_long),
         )
+
+        # Conv state commit: same destination slots, same scratch_slot_base
+        # source (column 0 in the non-APC kernel mode). The widened conv
+        # state at scratch[base] contains all K+1 candidates; the next
+        # step's kernel will use conv_state_token_offset = num_accepted - 1
+        # to select the right starting position in the widened dimension.
+        # Note: we use the RAW (non-transposed) view of both conv_state
+        # and scratch here — index_copy_ along dim=0 copies per-slot data
+        # element-by-element regardless of inner layout.
+        assert self.spec_scratch_conv_state is not None
+        conv_state_raw = self.kv_cache[0]
+        conv_state_raw.index_copy_(
+            0,
+            canonical_dst_long,
+            self.spec_scratch_conv_state.index_select(
+                0, scratch_slot_base_long
+            ),
+        )
+
         # Clear the pending so a subsequent call (or a no-spec step) is a no-op
         self._spec_scratch_pending = None
 

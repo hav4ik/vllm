@@ -6905,8 +6905,9 @@ class GPUModelRunner(
                 and getattr(layer, "_spec_scratch_enabled", False)
                 and layer.spec_scratch_ssm_state is None
             ):
+                conv_state = layer.kv_cache[0]
                 ssm_state = layer.kv_cache[1]
-                layer._init_spec_scratch_ssm_state(ssm_state)
+                layer._init_spec_scratch_states(conv_state, ssm_state)
 
         return kv_caches
 
