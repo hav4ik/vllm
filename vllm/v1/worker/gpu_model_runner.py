@@ -1455,12 +1455,6 @@ class GPUModelRunner(
                 self._get_mamba_copy_bufs(),
             )
         else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-            )
-            assert self.num_accepted_tokens_event is not None
-            self.num_accepted_tokens_event.record()
-
             # ============================================================
             # PC + spec decode + Mamba2 shadow-slot scratch commit.
             #
@@ -1471,26 +1465,100 @@ class GPUModelRunner(
             # absolutely segregated from the regular pool — this prevents
             # the radix tree from caching contaminated boundary states.
             #
-            # Now that the rejection sampler has determined how many
-            # tokens were accepted per request, copy the accepted state
-            # from each layer's scratch back to its canonical block slot.
-            # This MUST run before the scheduler's cache_blocks() commits
-            # blocks to the prefix cache (which happens later, in
-            # update_from_output), so the cache committer reads the
-            # correct state.
+            # Below we (a) clamp num_accepted_tokens to 1 for any request
+            # whose verify step crosses a mamba block boundary (the
+            # disable-at-boundary fix from
+            # docs/features/_pc_spec_decode_three_approaches.md option 1),
+            # then (b) mirror num_accepted_tokens.gpu to the input batch's
+            # CPU tensor (so the runner emits exactly the right number of
+            # output tokens per request), then (c) call each Mamba2Mixer
+            # layer's commit hook to copy the accepted scratch state back
+            # to the canonical pool. The clamp MUST happen first so that
+            # downstream consumers (CPU mirror, output emitter, commit
+            # hook) all see the same per-request accept count.
+            #
+            # The commit hook MUST run before the scheduler's
+            # cache_blocks() commits blocks to the prefix cache (which
+            # happens later, in update_from_output), so the cache
+            # committer reads the correct state.
             #
             # See _pc_spec_decode_upstream_status.md and
             # mamba_mixer2.py::MambaMixer2.commit_spec_scratch_to_canonical
             # for the design rationale.
-            if (
+
+            num_accepted_tokens_gpu = self.num_accepted_tokens.gpu[:num_reqs]
+            spec_pc_active = (
                 self.speculative_config is not None
                 and self.cache_config.mamba_cache_mode == "all"
-            ):
+            )
+
+            first_mamba_layer = None
+            if spec_pc_active:
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
                     MambaMixer2,
                 )
 
-                num_accepted_tokens_gpu = self.num_accepted_tokens.gpu[:num_reqs]
+                # All mamba layers see the same metadata so the unsafe
+                # mask is identical across them; we only need to read it
+                # from the first one we can find that participated in
+                # the spec scratch path this step.
+                for layer in (
+                    self.compilation_config.static_forward_context.values()
+                ):
+                    if isinstance(layer, MambaMixer2) and getattr(
+                        layer, "_spec_scratch_enabled", False
+                    ):
+                        first_mamba_layer = layer
+                        break
+
+            if (
+                first_mamba_layer is not None
+                and first_mamba_layer._spec_scratch_pending is not None
+            ):
+                # ----------------------------------------------------
+                # CLAMP num_accepted_tokens to 1 for unsafe requests.
+                # ----------------------------------------------------
+                # _spec_scratch_pending[0] is canonical_dst_slot_long_buf,
+                # whose first dim equals the number of decodes processed
+                # by this step. Use that as the slice length.
+                canonical_dst_long, _scratch_base = (
+                    first_mamba_layer._spec_scratch_pending
+                )
+                num_decodes_this_step = canonical_dst_long.shape[0]
+                # Slice both the unsafe mask buffer and the GPU
+                # num_accepted buffer to the same num_decodes prefix.
+                unsafe_mask_d = (
+                    first_mamba_layer._spec_scratch_unsafe_mask_bool[
+                        :num_decodes_this_step
+                    ]
+                )
+                num_accepted_decode = num_accepted_tokens_gpu[
+                    :num_decodes_this_step
+                ]
+                # In-place clamp: where unsafe, write 1; otherwise leave
+                # the rejection sampler's value unchanged.
+                # Note that this MUST happen BEFORE the CPU mirror copy
+                # and event record below, otherwise downstream consumers
+                # would see the unclamped values.
+                torch.where(
+                    unsafe_mask_d,
+                    torch.ones_like(num_accepted_decode),
+                    num_accepted_decode,
+                    out=num_accepted_decode,
+                )
+
+            # CPU mirror + event record. Order: clamp (above) → copy →
+            # event record. The event captures the post-clamp state so
+            # any wait()er sees the clamped values in the CPU tensor.
+            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+            )
+            assert self.num_accepted_tokens_event is not None
+            self.num_accepted_tokens_event.record()
+
+            # Per-layer commit hook (no-op when not enabled, e.g., on
+            # prefill-only steps or non-PC mamba modes).
+            if spec_pc_active:
                 for layer in (
                     self.compilation_config.static_forward_context.values()
                 ):
