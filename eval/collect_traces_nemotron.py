@@ -272,7 +272,10 @@ async def run_session(
         extra_body.update(vllm_sampling)
 
         for turn in range(max_turns):
-            # Cap completion tokens to remaining session budget
+            # Cap completion tokens to remaining session budget.
+            # If max_tokens <= 0, don't pass max_completion_tokens at all
+            # and let the server use max_model_len - prompt_len, which
+            # avoids 400 errors when prompt + max_tokens > max_model_len.
             remaining_tokens = max_tokens - total_completion_tokens
             if remaining_tokens <= 0:
                 finish_reason = "token_limit"
@@ -283,14 +286,16 @@ async def run_session(
             turn_completion_tokens = 0
             turn_prompt_tokens = 0
             try:
-                response = client.chat.completions.create(
+                completion_kwargs = dict(
                     model=model_name,
                     messages=messages,
                     tools=tools,
-                    max_completion_tokens=remaining_tokens,
                     **openai_sampling,
                     **({"extra_body": extra_body} if extra_body else {}),
                 )
+                if max_tokens > 0:
+                    completion_kwargs["max_completion_tokens"] = remaining_tokens
+                response = client.chat.completions.create(**completion_kwargs)
             except Exception as e:
                 LOG.error(f"[{problem_id}:{session_index}] API error: {e}")
                 finish_reason = "error"
@@ -883,7 +888,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--min_p", type=float, default=None)
-    parser.add_argument("--max_tokens", type=int, default=131072, help="Max completion tokens")
+    parser.add_argument("--max_tokens", type=int, default=0, help="Max completion tokens per session. 0 = no limit (server uses max_model_len - prompt_len)")
     parser.add_argument("--system_prompt", default=SYSTEM_PROMPT)
     parser.add_argument("--enable_thinking", action="store_true", default=True,
                         help="Enable <think> reasoning mode")
