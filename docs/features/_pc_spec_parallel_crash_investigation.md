@@ -114,3 +114,37 @@ are reclassified as prefills. Options:
    always in the correct group for mamba state management.
 
 Option 1 is simplest and most targeted.
+
+## Debug round 2: Comprehensive bounds checks
+
+Added Python-level OOB assertions before every `gather()` and
+`index_select()` in `mamba_mixer2.py`:
+- Prefill path (line 735): state_indices_tensor_p gather
+- Spec init path (line 888): state_indices_tensor_d gather
+- Commit path (line 1087): state_indices_d gather
+- ssm_state indexing (line 740)
+
+**Result: NO OOB assertions fired.** The crash is inside a CUDA kernel,
+not in Python-level tensor operations.
+
+## Crash dump analysis
+
+The scheduler output at crash time shows:
+```
+2 requests: num_computed_tokens=[1940, 6085]
+Both with num_scheduled_tokens=5 (spec decode: 1 target + 4 draft)
+Both are DECODE (not prefill)
+scheduled_spec_decode_tokens=[-1,-1,-1,-1] (all rejected from prev step)
+```
+
+**Key finding: The crash happens during DECODE, not during a cache-hit
+prefill.** Both requests are in normal spec decode mode. No cache hit
+is occurring at the crash step.
+
+This means:
+1. The reclassification hypothesis was WRONG for this crash
+2. The crash is in the CUDA kernel itself (SSM or conv), not in PyTorch
+3. Our cache hit fix changes block allocation patterns, which somehow
+   causes the kernel to receive invalid indices later during decode
+4. The baseline (without cache hit fix) handles 2 concurrent decodes
+   fine, so the block allocation difference is the trigger
