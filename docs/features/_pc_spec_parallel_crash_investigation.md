@@ -148,3 +148,48 @@ This means:
    causes the kernel to receive invalid indices later during decode
 4. The baseline (without cache hit fix) handles 2 concurrent decodes
    fine, so the block allocation difference is the trigger
+
+## Debug rounds 3-6: Systematic isolation
+
+### Round 3 (debug v3): Python OOB checks on all gather/index ops
+- Added bounds checks before every gather/index_select in mamba_mixer2.py
+- **NONE triggered.** Crash is inside a CUDA kernel, not Python ops.
+
+### Round 4 (debug v4): torch.cuda.synchronize() after target model forward
+- Sync after _model_forward() passed → target model is NOT the source
+- Crash caught at synchronize_input_prep in NEXT step
+- **Conclusion: crash is in sample_tokens (commit/drafter/bookkeeping)**
+
+### Round 5 (debug v5): 4 syncs (target, sample, commit, drafter)
+- All 4 syncs passed, crash STILL at synchronize_input_prep
+- **Conclusion: crash is AFTER the drafter, in post-drafter ops or
+  between sample_tokens completion and next execute_model**
+
+### Round 6 (debug v6): 5 syncs (+ end of sample_tokens)
+- STILL crashes at synchronize_input_prep even with sync at END of
+  sample_tokens
+- This means the crash kernel is launched AFTER sample_tokens returns
+- But sample_tokens is the last GPU-touching function before the next step
+
+### Round 7: sample_complete_event
+- Added CUDA event recorded at end of sample_tokens, waited at start
+  of execute_model's model forward
+- STILL crashes
+
+### Key finding: Only CUDA_LAUNCH_BLOCKING=1 prevents the crash
+
+This means it's NOT a simple ordering issue between steps. It's either:
+1. A CPU-GPU buffer race (CPU overwrites a buffer being async-copied)
+2. A race between different CUDA streams within the same step
+3. An issue with the async batch queue where multiple steps overlap
+   on the worker thread via futures
+
+The crash at `synchronize_input_prep()` catches the error via the
+`prepare_inputs_event`, which was recorded at the end of the PREVIOUS
+step's execute_model(). If a kernel launched by _prepare_inputs()
+(block_table copy, metadata setup) reads from a buffer that's still
+being written by a concurrent operation on another stream, the
+non-blocking copy could race with the kernel launch.
+
+With CUDA_LAUNCH_BLOCKING=1, all operations become synchronous,
+eliminating ALL races — but at a huge performance cost.
