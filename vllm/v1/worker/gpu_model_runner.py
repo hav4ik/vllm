@@ -648,9 +648,15 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
+        # cuda event to ensure sample_tokens() GPU work (commit +
+        # drafter) completes before the next step's model forward
+        # reads from the mamba state pool. With async batch queue,
+        # sample_tokens(N) can overlap with execute_model(N+1).
+        self.sample_complete_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+            self.sample_complete_event = torch.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -1522,10 +1528,6 @@ class GPUModelRunner(
             # PC + spec: commit boundary states from spec slots → pool
             if (self.speculative_config is not None
                 and self.cache_config.mamba_cache_mode == "all"):
-                # Ensure all prior GPU ops (including async block table
-                # copies and spec decode kernels) have completed before
-                # reading state_indices_tensor_d in the commit.
-                torch.cuda.synchronize()
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
                     MambaMixer2)
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
@@ -4100,6 +4102,12 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Wait for the previous step's sample_tokens() GPU work
+            # (commit_boundary_states, drafter) to complete before
+            # the model forward reads from the mamba state pool.
+            if self.sample_complete_event is not None:
+                self.sample_complete_event.synchronize()
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4401,6 +4409,15 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+
+
+        # Record event after all GPU work in sample_tokens()
+        # (commit_boundary_states, drafter, bookkeeping) so the
+        # next step's execute_model() can wait on it before reading
+        # the mamba state pool. With the async batch queue,
+        # sample_tokens(N) overlaps with execute_model(N+1).
+        if self.sample_complete_event is not None:
+            self.sample_complete_event.record()
 
         if not self.use_async_scheduling:
             return output
