@@ -860,32 +860,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 spec_ids = self._spec_slot_ids[:num_decodes]
                 base_long = self._spec_base_long[:num_decodes]
 
-                # Init spec slots from pool ONCE per request (first
-                # decode step after prefill). Detected via _spec_inited
-                # flag per batch position.
-                # Conv spec view (needed for kernel call below)
+                # Spec slot init (pool → spec[base+0]) is done by
+                # gpu_model_runner._init_mamba_spec_slots() BEFORE
+                # the model forward, outside cudagraph capture.
+                # No .any()/.nonzero() here — cudagraph-safe.
                 spec_conv_view = (
                     self.spec_conv if is_conv_state_dim_first()
                     else self.spec_conv.transpose(-1, -2))
-
-                # One-time init from pool for new requests
-                needs_init = ~self._spec_inited[:num_decodes]
-                if needs_init.any():
-                    init_idx = needs_init.nonzero(as_tuple=True)[0]
-                    canonical = state_indices_tensor_d.gather(
-                        1, block_idx_last_computed_token_d.unsqueeze(1)
-                    ).squeeze(1).long()
-                    init_bases = base_long[init_idx]
-                    init_canon = canonical[init_idx]
-                    # SSM
-                    self.spec_ssm.index_copy_(
-                        0, init_bases,
-                        ssm_state.index_select(0, init_canon))
-                    # Conv
-                    spec_conv_view.index_copy_(
-                        0, init_bases,
-                        conv_state.index_select(0, init_canon))
-                    self._spec_inited[init_idx] = True
 
                 # SSM kernel uses spec slots
                 state_indices_tensor_d_input = spec_ids
