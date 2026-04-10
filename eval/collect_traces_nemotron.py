@@ -644,6 +644,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
         f"{'Wait':>4} "
         f"{'Cache%':>7} "
         f"{'Cached':>9} "
+        f"{'Spec%':>6} "
         f"{'KV%':>6} "
         f"{'KV used/total':>16}"
     )
@@ -651,13 +652,14 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
 
     # CSV setup
     csv_path = "vllm-watchdog-live.csv"
-    CSV_HEADER = "timestamp,done,total,sb_errors,sb_calls,gen_tps,pfx_tps,reqs,running,waiting,cache_hit_pct,cached_tokens,kv_usage_pct,kv_used_tokens,kv_total_tokens\n"
+    CSV_HEADER = "timestamp,done,total,sb_errors,sb_calls,gen_tps,pfx_tps,reqs,running,waiting,cache_hit_pct,cached_tokens,spec_accept_pct,kv_usage_pct,kv_used_tokens,kv_total_tokens\n"
     csv_file = open(csv_path, "a")
     if csv_file.tell() == 0:
         csv_file.write(CSV_HEADER)
         csv_file.flush()
 
     prev_prompt = prev_gen = prev_reqs = prev_cache_q = prev_cache_h = None
+    prev_spec_draft = prev_spec_accept = None
     prev_sb_calls = prev_sb_errors = 0
     prev_time = None
     row_count = 0
@@ -697,6 +699,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
 
         # Fetch and aggregate vLLM metrics across all servers
         cur_prompt = cur_gen = cur_reqs = cur_cache_q = cur_cache_h = 0.0
+        cur_spec_draft = cur_spec_accept = 0.0
         running = waiting = 0.0
         agg_kv_used = agg_kv_total = 0
 
@@ -738,6 +741,10 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
             else:
                 cur_cache_q += _get_metric(m, "sglang:prompt_tokens_total")
                 cur_cache_h += _get_metric(m, "sglang:cached_tokens_total")
+            # Spec decode acceptance
+            cur_spec_draft  += _get_metric(m, "vllm:spec_decode_num_draft_tokens_total")
+            cur_spec_accept += _get_metric(m, "vllm:spec_decode_num_accepted_tokens_total")
+
             v_run = _get_metric(m, "vllm:num_requests_running")
             v_wait = _get_metric(m, "vllm:num_requests_waiting")
             if v_run == 0.0 and v_wait == 0.0:
@@ -772,6 +779,9 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                 d_cache_q  = cur_cache_q - prev_cache_q
                 d_cache_h  = cur_cache_h - prev_cache_h
                 cache_pct  = (d_cache_h / d_cache_q * 100) if d_cache_q > 0 else 0.0
+                d_spec_d   = cur_spec_draft - prev_spec_draft if prev_spec_draft is not None else 0
+                d_spec_a   = cur_spec_accept - prev_spec_accept if prev_spec_accept is not None else 0
+                spec_pct   = (d_spec_a / d_spec_d * 100) if d_spec_d > 0 else 0.0
 
                 ts = datetime.now().strftime("%H:%M:%S")
                 kv_str = f"{_human(used_tok)}/{_human(total_tok)}" if total_tok else "?"
@@ -787,6 +797,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                     f"{waiting:>4.0f} "
                     f"{cache_pct:>6.1f}% "
                     f"{_human(cur_cache_h):>9} "
+                    f"{spec_pct:>5.1f}% "
                     f"{kv_pct:>5.1f}% "
                     f"{kv_str:>16}",
                     flush=True,
@@ -799,14 +810,16 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                     f"{iso_ts},{done},{total_tasks},{d_sb_errors},{d_sb_calls},"
                     f"{gen_tps:.1f},{prompt_tps:.1f},{d_reqs:.0f},"
                     f"{running:.0f},{waiting:.0f},{cache_pct:.1f},"
-                    f"{cur_cache_h:.0f},{kv_pct:.2f},{used_tok},{total_tok}\n"
+                    f"{cur_cache_h:.0f},{spec_pct:.1f},{kv_pct:.2f},{used_tok},{total_tok}\n"
                 )
                 csv_file.flush()
 
-        prev_prompt  = cur_prompt
-        prev_gen     = cur_gen
-        prev_reqs    = cur_reqs
-        prev_cache_q = cur_cache_q
+        prev_prompt      = cur_prompt
+        prev_gen         = cur_gen
+        prev_reqs        = cur_reqs
+        prev_cache_q     = cur_cache_q
+        prev_spec_draft  = cur_spec_draft
+        prev_spec_accept = cur_spec_accept
         prev_cache_h = cur_cache_h
         prev_time    = now
 
