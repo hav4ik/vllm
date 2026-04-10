@@ -273,13 +273,16 @@ async def run_session(
 
         for turn in range(max_turns):
             # Cap completion tokens to remaining session budget.
-            # If max_tokens <= 0, don't pass max_completion_tokens at all
-            # and let the server use max_model_len - prompt_len, which
-            # avoids 400 errors when prompt + max_tokens > max_model_len.
-            remaining_tokens = max_tokens - total_completion_tokens
-            if remaining_tokens <= 0:
-                finish_reason = "token_limit"
-                break
+            # If max_tokens <= 0, skip the budget check entirely and
+            # don't pass max_completion_tokens to the API — the server
+            # uses max_model_len - prompt_len automatically.
+            if max_tokens > 0:
+                remaining_tokens = max_tokens - total_completion_tokens
+                if remaining_tokens <= 0:
+                    finish_reason = "token_limit"
+                    break
+            else:
+                remaining_tokens = 0  # signals "don't pass to API"
 
             # Call Chat Completions API (non-streaming)
             turn_start = time.time()
