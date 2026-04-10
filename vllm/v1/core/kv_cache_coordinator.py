@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 
@@ -517,12 +518,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
+                is_sliding_window = isinstance(spec, SlidingWindowSpec)
 
-                # Skip Eagle drop for ALL managers in the hybrid
-                # coordinator. The LCM-aligned block sizes make the
-                # drop too expensive, and max_cache_hit_length = num_tokens - 1
+                # Skip Eagle drop for FullAttention and Mamba (target
+                # model groups). The LCM-aligned block sizes make the
+                # drop too expensive — one 4608-token block drop wipes
+                # all cache hits. max_cache_hit_length = num_tokens - 1
                 # already ensures the last token is recomputed.
-                use_eagle_here = False
+                #
+                # Keep Eagle drop for SlidingWindow (drafter group).
+                # The drafter needs the drop for hidden-state recompute.
+                # But don't let its reduced hit length cascade to the
+                # target model groups — the drafter's cache is separate
+                # and should not constrain the target's cache hits.
+                use_eagle_here = self.use_eagle and is_sliding_window
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
@@ -544,7 +553,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         use_eagle=use_eagle_here,
                         alignment_tokens=self.lcm_block_size,
                     )
-                    curr_hit_length = len(hit_blocks[0]) * spec.block_size
+                    # Don't let the drafter's SlidingWindow group reduce
+                    # curr_hit_length. Its Eagle drop is necessary but
+                    # shouldn't cascade to the target model's groups.
+                    if not is_sliding_window:
+                        curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
                         hit_blocks_by_group[group_id] = blocks
 

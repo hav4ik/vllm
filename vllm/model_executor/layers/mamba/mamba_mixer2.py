@@ -1055,13 +1055,28 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         blk_before = (n_done - 1).clamp(min=0) // block_size
         blk_after = (n_done + n_acc - 1) // block_size
-        crossed = (blk_before != blk_after)
 
-        if not crossed.any():
+        # Detect boundary commits in two cases:
+        # 1. Crossed into a new block (tokens accepted past boundary)
+        # 2. Last accepted token lands exactly on a boundary position
+        #    (e.g. position 4607 with block_size=4608). Without this,
+        #    the boundary state would sit in scratch and be overwritten
+        #    by the next step's kernel before ever reaching the pool.
+        crossed_past = (blk_before != blk_after)
+        last_accepted_pos = n_done + n_acc - 1
+        at_boundary = (last_accepted_pos % block_size == block_size - 1)
+        needs_commit = crossed_past | at_boundary
+
+        if not needs_commit.any():
             self._spec_pending = None
             return
 
-        # Boundary position = last token of old block
+        # Boundary position = last token of the current (old) block.
+        # For crossed_past: this is the end of blk_before.
+        # For at_boundary (not crossed): this equals last_accepted_pos.
+        # Both formulas produce the same value in the at_boundary case
+        # because last_accepted_pos = blk_before * block_size + block_size - 1
+        # = (blk_before + 1) * block_size - 1.
         boundary_pos = (blk_before + 1) * block_size - 1
         # Which candidate has the boundary state
         cand_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
@@ -1070,12 +1085,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
         base = self._spec_base_long[:N]
         src_slot = base + cand_idx.long()
 
-        # Pool slot for old block
+        # Pool slot for the block containing the boundary
         pool_slot = state_indices_d.gather(
             1, blk_idx_last_computed.unsqueeze(1)
         ).squeeze(1).long()
 
-        ix = crossed.nonzero(as_tuple=True)[0]
+        ix = needs_commit.nonzero(as_tuple=True)[0]
         if ix.numel() > 0:
             # Commit SSM boundary state
             self.kv_cache[1].index_copy_(
