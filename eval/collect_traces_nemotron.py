@@ -569,7 +569,8 @@ def _route_to_server(problem_id: str, num_servers: int) -> int:
 _ABORT_EVENT = threading.Event()
 
 # Shared progress counters (updated by main thread, read by watchdog)
-_PROGRESS = {"completed": 0, "total": 0, "errors": 0, "sandbox_calls": 0, "sandbox_errors": 0}
+_PROGRESS = {"completed": 0, "total": 0, "errors": 0, "sandbox_calls": 0, "sandbox_errors": 0,
+             "correct": 0, "problems_done": 0, "problems_correct": 0}
 _PROGRESS_LOCK = threading.Lock()
 
 
@@ -636,6 +637,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
     HEADER = (
         f"{'Time':<9} "
         f"{'Done':>12} "
+        f"{'Acc':>10} "
         f"{'Sandbox':>12} "
         f"{'Gen t/s':>8} "
         f"{'Pfx t/s':>8} "
@@ -690,7 +692,9 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
             total_tasks = _PROGRESS["total"]
             cur_sb_calls = _PROGRESS["sandbox_calls"]
             cur_sb_errors = _PROGRESS["sandbox_errors"]
+            correct = _PROGRESS["correct"]
         done_str = f"{done}/{total_tasks}" if total_tasks else "—"
+        acc_str = f"{correct}/{done}" if done > 0 else "—"
         d_sb_calls = cur_sb_calls - prev_sb_calls
         d_sb_errors = cur_sb_errors - prev_sb_errors
         sb_str = f"{d_sb_errors}/{d_sb_calls}" if d_sb_calls else "0/0"
@@ -789,6 +793,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                 print(
                     f"{ts:<9} "
                     f"{done_str:>12} "
+                    f"{acc_str:>10} "
                     f"{sb_str:>12} "
                     f"{gen_tps:>8.1f} "
                     f"{prompt_tps:>8.1f} "
@@ -1084,10 +1089,15 @@ def main():
                     _append_result(output_dir, result)
                     completed += 1
                     last_progress_time = time.time()
+                    # Check accuracy
+                    is_correct = (str(result.get("predicted_answer", ""))
+                                  == str(result.get("expected_answer", "")))
                     with _PROGRESS_LOCK:
                         _PROGRESS["completed"] = completed
                         _PROGRESS["sandbox_calls"] += result.get("num_tool_calls", 0)
                         _PROGRESS["sandbox_errors"] += result.get("num_tool_errors", 0)
+                        if is_correct:
+                            _PROGRESS["correct"] += 1
 
                     if args.verbose:
                         ans = result["predicted_answer"]
