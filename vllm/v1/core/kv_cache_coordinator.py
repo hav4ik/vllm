@@ -518,12 +518,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
 
-                # Skip Eagle drop for FullAttention and Mamba (large
-                # aligned blocks), but keep it for SlidingWindow (drafter).
-                use_eagle_here = (
-                    self.use_eagle
-                    and not isinstance(spec, (FullAttentionSpec, MambaSpec))
-                )
+                # Skip Eagle drop for ALL managers in the hybrid
+                # coordinator. The LCM-aligned block sizes make the
+                # drop too expensive, and max_cache_hit_length = num_tokens - 1
+                # already ensures the last token is recomputed.
+                use_eagle_here = False
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]

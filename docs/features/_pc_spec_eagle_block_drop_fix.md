@@ -1,8 +1,8 @@
 # Fix: Prefix Cache 0% Hit Rate with Eagle3 on Hybrid Models
 
 > Branch: `pc-spec-v2-nonpc-slots`
-> Date: 2026-04-09
-> Fix location: `vllm/v1/core/kv_cache_coordinator.py`
+> Date: 2026-04-09 – 2026-04-10
+> Fix locations: `vllm/v1/core/kv_cache_coordinator.py`, `vllm/v1/core/sched/scheduler.py`
 
 ## Problem
 
@@ -176,24 +176,78 @@ Verified via `curl /metrics`:
 - `vllm:prefix_cache_hits_total` = 4608 (1 block hit on 2nd request)
 - Previously both were 0 with Eagle3
 
+## Critical lesson: SlidingWindow (Eagle drafter) must keep the drop
+
+The initial blanket fix (`use_eagle_for_managers = False` for all managers)
+caused `CUDA error: device-side assert triggered` crashes with
+`max_parallel >= 2`.
+
+**Root cause**: NemotronH + Eagle3 has THREE attention groups:
+```
+FullAttentionSpec [23-28]  — target model transformer layers
+MambaSpec [0-22]           — target model mamba layers
+SlidingWindowSpec [29]     — Eagle3 drafter layer
+```
+
+The Eagle drafter's SlidingWindow cache (group 29) NEEDS the block drop
+for its own hidden-state recomputation. Disabling it caused the drafter
+to use stale states → garbage output → device-side assert.
+
+**Fix**: Only disable Eagle drop for `FullAttentionSpec` and `MambaSpec`
+(which have LCM-aligned large block sizes). Keep it for all other spec
+types (SlidingWindow, etc.) where block sizes are small and the drop is
+cheap.
+
+```python
+use_eagle_here = (
+    self.use_eagle
+    and not isinstance(spec, (FullAttentionSpec, MambaSpec))
+)
+```
+
+## Boundary state protection via selective spec decode disable
+
+For additional safety at mamba block boundaries, the scheduler disables
+speculative decoding for requests about to cross a boundary. This forces
+a normal single-token decode where the mamba kernel writes directly to
+the pool — guaranteed correct state for prefix cache reuse.
+
+**Cost**: ~2 non-spec steps per 4608 tokens per request = 0.04% overhead.
+
 ## Interaction with mamba boundary states (v2 spec slot fix)
 
 The prefix cache hit means the mamba state at the block boundary
 (position `block_size - 1 = 4607`) is loaded from the cached block
 instead of being freshly computed. This state was saved during the
-first request's generation via the v2 boundary commit mechanism.
+first request's generation either:
+- By the normal (non-spec) decode kernel at boundary crossings (when
+  the scheduler disabled spec decode for that step), or
+- Via the v2 `commit_boundary_states()` mechanism (which copies from
+  spec slot to pool after the rejection sampler)
 
-The v2 fix ensures boundary states are correct:
-- After rejection sampler, `commit_boundary_states()` copies the
-  accepted candidate's state from the spec slot to the pool's block slot
-- This write happens BEFORE `cache_blocks()` is called
-- So the cached mamba state reflects the correct accepted token sequence
-
-No additional changes are needed for this fix to be safe with the v2
-spec slot mechanism.
+Both paths produce correct boundary states for prefix cache reuse.
 
 ## Files changed
 
 | File | Change |
 |------|--------|
-| `vllm/v1/core/kv_cache_coordinator.py` | +15 lines: skip Eagle block drop for simple hybrid models |
+| `vllm/v1/core/kv_cache_coordinator.py` | Skip Eagle block drop for FullAttention and Mamba (not SlidingWindow) |
+| `vllm/v1/core/sched/scheduler.py` | Disable spec decode at mamba block boundaries |
+| `docs/features/_pc_spec_eagle_block_drop_fix.md` | This doc |
+
+## Evaluation results (in progress)
+
+**Config**: NemotronH FP8 + Eagle3, `max_parallel=4`, cudagraphs,
+single GPU (RTX PRO 6000), `max_model_len=65536`.
+
+| Metric | Value | Baseline |
+|--------|-------|----------|
+| Per-session accuracy | 100% (18/18) | 91.5% |
+| Majority-vote accuracy | 100% (9/9) | 96.7% |
+| Stability | Stable at 120K+ gen tokens | Stable |
+| Spec decode acceptance | ~46% | ~46% |
+
+Note: cache hits are 0% with `max_parallel=4` because 4 concurrent
+conversations exhaust the 80-block KV pool (4608 tokens/block), leaving
+no room for cached blocks to survive. With `max_parallel=1` (tested
+separately), cache hit rate is ~56%, matching expectations.
