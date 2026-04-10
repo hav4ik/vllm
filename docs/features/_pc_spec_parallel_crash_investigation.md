@@ -224,3 +224,49 @@ This could be:
 The key invariant: the crash ONLY happens when our cache hit fix
 changes num_computed_tokens from 0 to 4608+. This is a code path
 never exercised in the baseline.
+
+## Round 8-9: Async scheduling and full sync at start
+
+### Round 8: --no-async-scheduling
+Disabled async batch queue entirely. STILL crashes at ~14K gen tokens.
+Eliminates the batch queue overlap as the cause.
+
+### Round 9: torch.cuda.synchronize() at START of execute_model
+Added sync before ANY work in execute_model (syncs all streams, all
+devices). STILL crashes.
+
+This means the race is NOT between steps or between streams. The crash
+happens within a SINGLE execute_model+sample_tokens call, within
+operations on the DEFAULT stream.
+
+### Current understanding (updated)
+
+The `torch.cuda.synchronize()` at the start ensures all prior GPU
+work is complete. Then execute_model runs: _prepare_inputs → build
+metadata → model forward → sample → commit → drafter. ALL on the
+default stream (with enforce-eager). Yet it still crashes.
+
+The only explanation: a KERNEL-LEVEL bug where the kernel itself has
+an index-out-of-bounds for certain input patterns. Our cache hit fix
+changes the block table pattern (some entries point to cached blocks
+instead of fresh allocations), and a kernel (Triton or CUDA) doesn't
+handle this pattern correctly.
+
+This requires CUDA compute-sanitizer (racecheck/memcheck) to debug
+further. The Python-level investigation has exhausted all plausible
+inter-operation races.
+
+### Alternative: the crash is deterministic, not a race
+
+If torch.cuda.synchronize() at every possible point doesn't help,
+and CUDA_LAUNCH_BLOCKING=1 DOES help, the difference might be in
+how CUDA_LAUNCH_BLOCKING affects kernel compilation or launch
+parameters, not just timing. CUDA_LAUNCH_BLOCKING=1 forces
+synchronous kernel launches which can change:
+- Grid/block dimensions (some kernels adapt to occupancy)
+- Memory allocation patterns
+- Tensor layout/stride assumptions
+
+This opens the possibility that CUDA_LAUNCH_BLOCKING=1 works not
+because it serializes, but because it changes some kernel parameter
+that avoids the bug.
