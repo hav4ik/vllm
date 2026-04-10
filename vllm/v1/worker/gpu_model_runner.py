@@ -1519,16 +1519,12 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
-            # PC + spec: commit boundary states from spec slots → pool.
-            # The synchronize() ensures all prior async GPU ops (block
-            # table copies, model forward) complete before we read
-            # state_indices_tensor_d in the commit. Without this, a
-            # race between the commit's pool writes and the next step's
-            # prefill reads causes device-side asserts.
-            # TODO: replace with a targeted CUDA event once the exact
-            # racing streams are identified.
+            # PC + spec: commit boundary states from spec slots → pool
             if (self.speculative_config is not None
                 and self.cache_config.mamba_cache_mode == "all"):
+                # Ensure all prior GPU ops (including async block table
+                # copies and spec decode kernels) have completed before
+                # reading state_indices_tensor_d in the commit.
                 torch.cuda.synchronize()
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
                     MambaMixer2)
