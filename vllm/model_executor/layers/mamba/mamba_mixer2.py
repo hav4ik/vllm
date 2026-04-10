@@ -1003,11 +1003,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.spec_ssm = torch.as_strided(
             raw_ssm, (total, *ssm_shape), (page_el, *inner_s), 0)
 
-        # Conv spec slots — contiguous (pool is page-padded but
-        # index_copy_ handles stride mismatch correctly)
+        # Conv spec slots — must use PAGE-PADDED stride matching
+        # the pool. The conv kernel reads stride[0] from the tensor
+        # for pointer arithmetic. Contiguous strides cause wrong
+        # memory offsets and OOB access under cudagraph replay.
         conv_shape = conv_state.shape[1:]
-        self.spec_conv = torch.zeros((total, *conv_shape),
-                                     dtype=conv_state.dtype, device=device)
+        conv_page_el = conv_state.stride(0)
+        conv_inner_s = torch.empty(conv_shape).stride()
+        raw_conv = torch.zeros(total * conv_page_el,
+                               dtype=conv_state.dtype, device=device)
+        self.spec_conv = torch.as_strided(
+            raw_conv, (total, *conv_shape),
+            (conv_page_el, *conv_inner_s), 0)
 
         # Pre-computed slot IDs: spec_slot_ids[i][j] = 1 + i*K1 + j
         bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * K1
