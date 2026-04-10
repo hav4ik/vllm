@@ -291,3 +291,34 @@ our prefix cache fix. Without Eagle3, everything works.
 The next step: instrument the Eagle3 propose() method and its kernels
 (eagle_step_update_slot_mapping_and_metadata, the drafter's model
 forward) to find the exact OOB index.
+
+## Round 11: seq_lens clone fix
+
+Found that Eagle's propose() modifies `common_attn_metadata.seq_lens`
+in-place, which is a VIEW of `self.seq_lens` in gpu_model_runner.
+Two modification paths:
+1. `seq_lens -= num_rejected_tokens_gpu` (Python in-place op)
+2. `eagle_step_update_slot_mapping_and_metadata` Triton kernel writes
+   `seq_lens += 1` per drafter iteration
+
+Fix: `common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()`
+before any modifications.
+
+Result: crash moved from ~8K to ~55K gen tokens with max_parallel=4.
+Significant improvement but not a complete fix.
+
+Cloning additional tensors (block_table_tensor, slot_mapping,
+query_start_loc) did NOT help further — the 55K crash is a different
+issue from the seq_lens corruption.
+
+## Current status
+
+The seq_lens clone significantly reduces the crash frequency.
+The remaining crash at ~55K gen tokens requires further investigation
+(possibly with CUDA compute-sanitizer or by identifying additional
+shared state that the drafter corrupts).
+
+For production use:
+- max_parallel=1 + enforce-eager: FULLY STABLE, all metrics good
+- max_parallel=4: survives ~55K tokens (~5 problems) with seq_lens clone
+- Full 30-problem eval: needs either max_parallel=1 or TP=2 setup
