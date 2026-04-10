@@ -1063,6 +1063,25 @@ class GPUModelRunner(
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
+        # Reset spec scratch init flags for finished requests so the
+        # batch position can be reused by a new request with fresh init.
+        if (self.speculative_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+            and scheduler_output.finished_req_ids):
+            from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+                MambaMixer2)
+            for req_id in scheduler_output.finished_req_ids:
+                batch_idx = self.input_batch.req_id_to_index.get(req_id)
+                if batch_idx is not None:
+                    for layer in (
+                        self.compilation_config.static_forward_context
+                            .values()
+                    ):
+                        if (isinstance(layer, MambaMixer2)
+                            and hasattr(layer, '_spec_inited')
+                            and layer._spec_inited is not None):
+                            layer._spec_inited[batch_idx] = False
+
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1349,7 +1368,51 @@ class GPUModelRunner(
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
+        # Save pre-condense mapping for mamba scratch rearrangement
+        _pre_condense_mapping = None
+        if (self.speculative_config is not None
+            and self.cache_config.mamba_cache_mode == "all"):
+            _pre_condense_mapping = dict(self.input_batch.req_id_to_index)
         self.input_batch.condense()
+
+        # Rearrange mamba spec scratch data after condense
+        if _pre_condense_mapping is not None:
+            from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+                MambaMixer2)
+            post_mapping = self.input_batch.req_id_to_index
+            moves = []
+            for req_id, new_pos in post_mapping.items():
+                old_pos = _pre_condense_mapping.get(req_id)
+                if old_pos is not None and old_pos != new_pos:
+                    moves.append((old_pos, new_pos))
+            if moves:
+                for layer in (
+                    self.compilation_config.static_forward_context
+                        .values()
+                ):
+                    if (isinstance(layer, MambaMixer2)
+                        and hasattr(layer, '_spec_scratch_enabled')
+                        and layer._spec_scratch_enabled
+                        and layer.spec_scratch_ssm_state is not None):
+                        K1 = layer._spec_scratch_slots_per_req
+                        for old_pos, new_pos in moves:
+                            old_base = 1 + old_pos * K1
+                            new_base = 1 + new_pos * K1
+                            old_sl = slice(old_base, old_base + K1)
+                            new_sl = slice(new_base, new_base + K1)
+                            # Move SSM scratch data
+                            layer.spec_scratch_ssm_state[new_sl] = (
+                                layer.spec_scratch_ssm_state[old_sl]
+                                    .clone())
+                            # Move conv scratch data
+                            layer.spec_scratch_conv_state[new_sl] = (
+                                layer.spec_scratch_conv_state[old_sl]
+                                    .clone())
+                            # Move init flag
+                            layer._spec_inited[new_pos] = (
+                                layer._spec_inited[old_pos])
+                            layer._spec_inited[old_pos] = False
+
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.

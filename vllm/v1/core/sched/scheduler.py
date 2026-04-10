@@ -1691,6 +1691,20 @@ class Scheduler(SchedulerInterface):
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+
+            # For hybrid models with mamba prefix caching, disable spec
+            # decode for requests about to cross a mamba block boundary.
+            # This ensures the boundary state is written cleanly to the
+            # pool by the normal (non-spec) decode kernel.
+            if (self.has_mamba_layers
+                    and self.cache_config.mamba_cache_mode == "all"
+                    and self.cache_config.enable_prefix_caching):
+                mamba_bs = self.cache_config.mamba_block_size
+                n = request.num_computed_tokens
+                next_boundary = ((n // mamba_bs) + 1) * mamba_bs
+                if next_boundary - n <= len(spec_token_ids) + 1:
+                    spec_token_ids = []
+
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(

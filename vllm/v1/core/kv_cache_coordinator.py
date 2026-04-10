@@ -21,6 +21,8 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 
@@ -499,6 +501,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
+                is_sliding_window = isinstance(spec, SlidingWindowSpec)
+
+                # Skip Eagle drop for FullAttention and Mamba (target
+                # model groups with LCM-aligned large block sizes).
+                # Keep it for SlidingWindow (Eagle drafter needs it).
+                # Don't let SlidingWindow's reduced length cascade.
+                use_eagle_here = self.use_eagle and is_sliding_window
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
@@ -517,10 +526,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_group_ids=group_ids,
                         block_pool=self.block_pool,
                         kv_cache_spec=spec,
-                        use_eagle=self.use_eagle,
+                        use_eagle=use_eagle_here,
                         alignment_tokens=self.lcm_block_size,
                     )
-                    curr_hit_length = len(hit_blocks[0]) * spec.block_size
+                    # Don't let drafter's SlidingWindow reduce the
+                    # target model's cache hit length.
+                    if not is_sliding_window:
+                        curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
                         hit_blocks_by_group[group_id] = blocks
 

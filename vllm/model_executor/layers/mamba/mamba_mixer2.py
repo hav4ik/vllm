@@ -1076,28 +1076,32 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 )
 
                 # ===========================================================
-                # 4. Initialization copy: pool → scratch[base+0].
-                #    ONLY needed on the first decode step after prefill
-                #    (when scratch[base+0] hasn't been populated yet).
-                #    We ALWAYS do this copy because it's harmless when
-                #    the kernel reads from base+init_token_idx > 0 (the
-                #    copy only affects base+0, which isn't read). When
-                #    init_token_idx = 0 (num_accepted_prev = 1), this
-                #    copy ensures base+0 has valid data from the pool.
+                # 4. ONE-TIME initialization: pool → scratch[base+0].
+                #    Only runs on the first decode step after prefill for
+                #    each request. After init, states persist in scratch
+                #    across steps — the kernel's native init_token_idx
+                #    rollback handles candidate selection, just like the
+                #    non-PC path. NO per-step pool reads.
                 #
-                #    NOTE: this is the ONLY pool→scratch copy per step.
-                #    There is NO scratch→pool commit on non-boundary
-                #    steps. States persist in scratch across steps, and
-                #    the kernel's built-in init_token_idx rollback
-                #    handles candidate selection (just like the no-PC
-                #    path). This eliminates the round-trip that was
-                #    causing the 92% → 50% accuracy degradation.
+                #    The old per-step pre-copy read stale pool data every
+                #    step (the pool is only updated at block boundaries),
+                #    which clobbered the accepted state when init_token_idx=0
+                #    and caused 92% → 50% accuracy degradation.
                 # ===========================================================
-                self.spec_scratch_ssm_state.index_copy_(
-                    0,
-                    scratch_slot_base_long,
-                    ssm_state.index_select(0, canonical_in_slot_long_buf),
-                )
+                needs_init = ~self._spec_inited[:num_decodes]
+                if needs_init.any():
+                    init_idx = needs_init.nonzero(as_tuple=True)[0]
+                    init_bases = scratch_slot_base_long[init_idx]
+                    init_canon = canonical_in_slot_long_buf[init_idx]
+                    # SSM: pool → scratch[base+0]
+                    self.spec_scratch_ssm_state.index_copy_(
+                        0, init_bases,
+                        ssm_state.index_select(0, init_canon))
+                    # Conv: pool → scratch[base+0] (raw layout, no transpose)
+                    self.spec_scratch_conv_state.index_copy_(
+                        0, init_bases,
+                        self.kv_cache[0].index_select(0, init_canon))
+                    self._spec_inited[init_idx] = True
 
                 # ===========================================================
                 # 5. Stash for the worker's boundary-only commit.
@@ -1171,33 +1175,46 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 ssm_state_for_kernel = ssm_state
 
             # 2. Convolution sequence transformation
-            # When the spec scratch path is active, route conv_state
-            # through the scratch tensor too: pre-copy canonical →
-            # scratch, run the kernel with scratch (non-APC mode so the
-            # widened state + num_accepted offset logic handles per-
-            # candidate rollback), then commit in the post-step hook.
-            # Conv state: use the regular pool directly (no scratch).
-            # With prefix cache hits at 0% (upstream issue #38182),
-            # contamination of cached conv boundary states doesn't
-            # matter — nobody reads them. This eliminates the conv
-            # round-trip (pool→scratch→pool) which was suspected of
-            # causing the accuracy degradation from 92% → 50%.
-            # The SSM state still uses scratch (needed for K+1 slots).
-            hidden_states_B_C_d = causal_conv1d_update(
-                hidden_states_B_C_d,
-                conv_state,
-                self.conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=state_indices_tensor_d,
-                block_idx_last_scheduled_token=(
-                    block_idx_last_scheduled_token_d
-                ),
-                initial_state_idx=block_idx_last_computed_token_d,
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=query_start_loc_d,
-                max_query_len=state_indices_tensor_d.size(-1),
-            )
+            if use_spec_scratch_path:
+                # Route conv through scratch in non-APC mode.
+                # Conv uses ONE slot per request (K+1 candidates stored
+                # as token offsets within the widened slot dimension).
+                # Use scratch_output_indices (shape batch × K+1) so
+                # max_query_len = K+1 matches the non-PC path. The
+                # kernel reads [seq, 0] = base slot in non-APC mode.
+                spec_conv_view = (
+                    self.spec_scratch_conv_state
+                    if is_conv_state_dim_first()
+                    else self.spec_scratch_conv_state.transpose(-1, -2))
+                hidden_states_B_C_d = causal_conv1d_update(
+                    hidden_states_B_C_d,
+                    spec_conv_view,
+                    self.conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=scratch_output_indices,
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=self._spec_scratch_slots_per_req,
+                )
+            else:
+                hidden_states_B_C_d = causal_conv1d_update(
+                    hidden_states_B_C_d,
+                    conv_state,
+                    self.conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=state_indices_tensor_d,
+                    block_idx_last_scheduled_token=(
+                        block_idx_last_scheduled_token_d
+                    ),
+                    initial_state_idx=block_idx_last_computed_token_d,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=state_indices_tensor_d.size(-1),
+                )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
@@ -1305,27 +1322,25 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
 
         # ===========================================================
-        # Conv state scratch (same segregation principle as SSM state).
-        # The conv_state in the regular pool has shape
-        #   (num_blocks, conv_dim, state_len)
-        # where state_len = conv_kernel - 1 + num_spec (widened for spec).
-        #
-        # IMPORTANT: we use CONTIGUOUS allocation for conv scratch
-        # (NOT the page-padded stride used by the regular pool). The
-        # page padding is huge (~2.3MB/slot for NemotronH) because it's
-        # shared with the SSM state segment, but the conv data is only
-        # ~196KB/slot. Page-padded scratch would waste ~5.8GB across 31
-        # layers, causing OOM. Contiguous scratch is ~481MB total.
-        #
-        # PyTorch's index_copy_ / index_select handle the stride
-        # mismatch between page-padded pool and contiguous scratch
-        # correctly: they copy element-by-element, not raw bytes.
+        # Conv state scratch: must use PAGE-PADDED allocation matching
+        # the pool's stride. The conv kernel reads stride[0] from the
+        # tensor to compute memory offsets. With contiguous stride,
+        # the kernel would access wrong memory locations.
         # ===========================================================
         conv_per_slot_shape = conv_state.shape[1:]
-        self.spec_scratch_conv_state = torch.zeros(
-            (total_slots, *conv_per_slot_shape),
+        conv_page_size = conv_state.stride(0)
+        conv_inner_stride = torch.empty(conv_per_slot_shape).stride()
+        conv_target_stride = (conv_page_size, *conv_inner_stride)
+        raw_conv = torch.zeros(
+            total_slots * conv_page_size,
             dtype=conv_state.dtype,
             device=conv_state.device,
+        )
+        self.spec_scratch_conv_state = torch.as_strided(
+            raw_conv,
+            size=(total_slots, *conv_per_slot_shape),
+            stride=conv_target_stride,
+            storage_offset=0,
         )
 
         # ===========================================================
@@ -1470,6 +1485,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
             (M,), device=device, dtype=torch.long
         )
 
+        # Per-batch-position flag: True once spec scratch has been
+        # initialized from the pool for this request. Reset when the
+        # request finishes (via gpu_model_runner finish hook).
+        self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
+
     def commit_spec_scratch_to_canonical(
         self,
         num_accepted_tokens: torch.Tensor,
@@ -1558,9 +1578,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 ),
             )
 
-        # Conv state: NO scratch commit needed. Conv state goes directly
-        # through the regular pool (no scratch round-trip). See the
-        # comment in the forward path above the causal_conv1d_update call.
+        # Conv boundary commit: scratch[base] → pool[canonical_dst]
+        # Conv uses one slot per request — no in-scratch promote needed.
+        if has_boundary:
+            self.kv_cache[0].index_copy_(
+                0, canonical_dst_long,
+                self.spec_scratch_conv_state.index_select(
+                    0, scratch_slot_base_long))
 
         # Clear the pending so a subsequent call (or a no-spec step) is a no-op
         self._spec_scratch_pending = None

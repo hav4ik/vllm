@@ -530,6 +530,15 @@ class SpecDecodeBaseProposer:
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
+        # Clone seq_lens to avoid corrupting the shared self.seq_lens
+        # tensor in gpu_model_runner. The drafter modifies seq_lens
+        # in-place below (seq_lens -= ...) and the Triton kernel
+        # eagle_step_update_slot_mapping_and_metadata writes seq_lens += 1
+        # per iteration. Without the clone, these mutations propagate to
+        # the next step's _prepare_inputs(), causing index OOB crashes
+        # at max_parallel >= 2.
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
         # Only apply this adjustment when we have rejected tokens
