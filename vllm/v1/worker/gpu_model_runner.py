@@ -1465,75 +1465,6 @@ class GPUModelRunner(
         else:
             return None
 
-    def _init_mamba_spec_slots(self, attn_metadata: dict) -> None:
-        """Pre-forward hook: init spec slots from pool for new decode
-        requests. Runs OUTSIDE cudagraph capture so .any()/.nonzero()
-        are safe. The forward path then uses spec slots unconditionally.
-        """
-        from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-        from vllm.model_executor.layers.mamba.mamba_utils import (
-            is_conv_state_dim_first,
-        )
-
-        # Only need to run once for the first mamba layer — all layers
-        # see the same metadata and have matching _spec_inited state.
-        # But each layer has its OWN kv_cache and spec slots, so we
-        # must iterate all layers.
-        for layer in self.compilation_config.static_forward_context.values():
-            if not (isinstance(layer, MambaMixer2)
-                    and getattr(layer, '_pc_spec_enabled', False)
-                    and layer.spec_ssm is not None
-                    and hasattr(layer, '_spec_inited')):
-                continue
-
-            # Get metadata for this layer
-            md = attn_metadata.get(layer.prefix)
-            if md is None or not hasattr(md, 'num_decodes'):
-                continue
-
-            num_decodes = md.num_decodes
-            if num_decodes == 0:
-                continue
-
-            needs_init = ~layer._spec_inited[:num_decodes]
-            if not needs_init.any():
-                continue
-
-            init_idx = needs_init.nonzero(as_tuple=True)[0]
-
-            # state_indices_tensor_d is decode-only (from metadata builder)
-            # block_idx_last_computed_token is full (prefill+decode),
-            # so we slice to [:num_decodes] for the decode portion
-            sid = md.state_indices_tensor_d
-            blk_idx = md.block_idx_last_computed_token
-            if sid is None or blk_idx is None:
-                continue
-
-            canonical = sid[:num_decodes].gather(
-                1, blk_idx[:num_decodes].unsqueeze(1)
-            ).squeeze(1).long()
-
-            base_long = layer._spec_base_long[:num_decodes]
-            init_bases = base_long[init_idx]
-            init_canon = canonical[init_idx]
-
-            # SSM: pool → spec[base+0]
-            layer.spec_ssm.index_copy_(
-                0, init_bases,
-                layer.kv_cache[1].index_select(0, init_canon))
-
-            # Conv: pool → spec[base+0]
-            pool_cv = layer.kv_cache[0]
-            spec_cv = layer.spec_conv
-            if not is_conv_state_dim_first():
-                pool_cv = pool_cv.transpose(-1, -2)
-                spec_cv = spec_cv.transpose(-1, -2)
-            spec_cv.index_copy_(
-                0, init_bases,
-                pool_cv.index_select(0, init_canon))
-
-            layer._spec_inited[init_idx] = True
-
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -4178,14 +4109,6 @@ class GPUModelRunner(
             # the model forward reads from the mamba state pool.
             if self.sample_complete_event is not None:
                 self.sample_complete_event.synchronize()
-
-            # Pre-forward spec init: copy pool → spec slots for new
-            # decode requests. Runs OUTSIDE cudagraph capture (before
-            # _model_forward). Uses _spec_inited with .any()/.nonzero()
-            # which is safe here (CPU branching OK outside capture).
-            if (self.speculative_config is not None
-                    and self.cache_config.mamba_cache_mode == "all"):
-                self._init_mamba_spec_slots(attn_metadata)
 
             model_output = self._model_forward(
                 input_ids=input_ids,
