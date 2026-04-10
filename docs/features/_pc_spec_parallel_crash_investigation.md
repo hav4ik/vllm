@@ -193,3 +193,34 @@ non-blocking copy could race with the kernel launch.
 
 With CUDA_LAUNCH_BLOCKING=1, all operations become synchronous,
 eliminating ALL races — but at a huge performance cost.
+
+## Analysis: Eagle drafter block_table mismatch (ruled out)
+
+Investigated whether the Eagle drafter uses the wrong block_table or
+block_size. Finding: the drafter selects its own CommonAttentionMetadata
+based on `kv_cache_gid` (line 2385 in gpu_model_runner.py), so the
+block_table IS for the drafter's SlidingWindow group with correct sizes.
+
+## Current state of understanding
+
+The crash is a race condition confirmed by:
+- Only CUDA_LAUNCH_BLOCKING=1 prevents it (full serialization)
+- Event syncs between execute_model/sample_tokens don't help
+- torch.cuda.synchronize() at every pipeline stage doesn't help
+- The DSA error is IndexKernel.cu "index out of bounds"
+- Python-level OOB checks on all mamba tensor ops don't trigger
+
+The race is NOT between:
+- execute_model(N) and execute_model(N+1)
+- sample_tokens(N) and execute_model(N+1)
+- target model forward and drafter forward
+
+The race IS between something that only CUDA_LAUNCH_BLOCKING serializes.
+This could be:
+- An intra-kernel race (two CUDA thread blocks accessing shared memory)
+- A host-device race (CPU pinned memory modified while GPU DMA reads it)
+- A multi-stream race within the SAME step (e.g., async_output_copy_stream)
+
+The key invariant: the crash ONLY happens when our cache hit fix
+changes num_computed_tokens from 0 to 4608+. This is a code path
+never exercised in the baseline.
