@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
 )
 from vllm.v1.request import Request
 
@@ -494,29 +495,35 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             self.attention_groups[0][0], FullAttentionSpec
         )
 
-        # For hybrid models, DO NOT apply the Eagle block drop inside the
-        # individual managers. The block drop removes the last matched block
-        # to force recomputation of hidden states for Eagle's drafter. For
+        # For hybrid models, skip the Eagle block drop for FullAttention
+        # and Mamba managers. The drop removes the last matched block to
+        # force hidden-state recomputation for Eagle's drafter. For
         # transformer-only models (block_size=16), this is cheap. But for
-        # hybrid models, block alignment inflates block_size to the LCM of
-        # all attention types (e.g., 4608 tokens for NemotronH). Dropping
-        # one such block wipes out most or all cache hits.
+        # hybrid models, block alignment inflates block_size to the LCM
+        # of all attention types (e.g., 4608 tokens for NemotronH).
+        # Dropping one such block wipes out most or all cache hits.
         #
-        # This is safe because KVCacheManager.get_computed_blocks() already
-        # sets max_cache_hit_length = num_tokens - 1, which guarantees at
-        # least the last token is always recomputed during prefill. That
-        # recomputation produces the fresh hidden states Eagle needs.
+        # This is safe because KVCacheManager.get_computed_blocks()
+        # already sets max_cache_hit_length = num_tokens - 1, which
+        # guarantees at least the last token is always recomputed
+        # during prefill (producing the fresh hidden states Eagle needs).
         #
-        # This applies to ALL hybrid models (not just simple hybrids),
-        # because the HybridKVCacheCoordinator always uses LCM-aligned
-        # block sizes which are much larger than the default 16 tokens.
-        use_eagle_for_managers = False
+        # IMPORTANT: We still pass use_eagle=True to SlidingWindow
+        # managers (used by Eagle's drafter layers). The drafter needs
+        # the block drop for its own hidden-state recomputation.
 
         while True:
             curr_hit_length = hit_length
 
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
+
+                # Skip Eagle drop for FullAttention and Mamba (large
+                # aligned blocks), but keep it for SlidingWindow (drafter).
+                use_eagle_here = (
+                    self.use_eagle
+                    and not isinstance(spec, (FullAttentionSpec, MambaSpec))
+                )
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
@@ -535,7 +542,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_group_ids=group_ids,
                         block_pool=self.block_pool,
                         kv_cache_spec=spec,
-                        use_eagle=use_eagle_for_managers,
+                        use_eagle=use_eagle_here,
                         alignment_tokens=self.lcm_block_size,
                     )
                     curr_hit_length = len(hit_blocks[0]) * spec.block_size
