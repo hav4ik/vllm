@@ -1,11 +1,67 @@
 # PC + Eagle3 Spec Decode: Final Status
 
 > Branch: `pc-spec-v2-nonpc-slots`
-> Date: 2026-04-11 (superseded the 2026-04-10 "0% hits" version below)
+> Date: 2026-04-11 (with spec slot allocation fix; supersedes earlier sections)
 > Model: NemotronH (chankhavu/Nemotron-Cascade-2-30B-A3B-FP8)
 > Eagle3 drafter: chankhavu/c2.eagle3-test
 
-## TL;DR — 2026-04-11 update
+## TL;DR — 2026-04-11 spec slot allocation fix
+
+After commit `58cc892a0`, the PC + Eagle3 path runs at the **full**
+`max_num_seqs=32 + max_model_len=262144 + num_speculative_tokens=5`
+configuration on a 94 GB GPU. AIME-25 verification at this config:
+
+| Criterion | Result |
+|---|---|
+| AIME-25 per-session accuracy | **29/30 = 96.7%** (>90% target) |
+| Prefix cache hit rate (peak) | **93.9%** |
+| Eagle3 draft acceptance (peak) | **40.9%** |
+| Server boot at max_num_seqs=32 + K=5 | **OK** (was OOM 52 GiB before) |
+
+### What the fix does
+
+`MambaMixer2.init_spec_slots` previously allocated each spec slot at
+`pool.stride(0)`, which is the LCM-padded `mamba_page_size` the unified
+mamba+attention pool uses to share storage with attention KV. For this
+model that's ~50 MB per slot per layer even though the actual SSM state
+per slot is only ~1.3 MB. At `max_num_seqs=32 × num_spec=5 × 23 mamba
+layers` the wasteful per-page allocation needed ~52 GiB on top of the
+model weights and Eagle drafter, OOMing the GPU.
+
+The kernels (`selective_state_update`, `causal_conv1d_update`) read
+`state.stride(0)` off the tensor we hand them — not the pool's stride.
+A contiguous allocation gives `stride(0) = prod(state_shape)` and the
+pointer arithmetic stays correct. Dropping the page-padded layout
+shrinks the spec slot footprint ~10×, leaving room to run `max_num_seqs
+= 32` apples-to-apples with the PC-only and Eagle3-only baselines.
+
+### Verified startup command (the one that works at full config)
+
+```bash
+HF_HOME=/workspace/.hf_home VLLM_USE_FLASHINFER_MOE_FP8=1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+vllm serve chankhavu/Nemotron-Cascade-2-30B-A3B-FP8 \
+  --max-model-len 262144 --trust-remote-code \
+  --mamba-ssm-cache-dtype float16 --max-num-seqs 32 \
+  --kv-cache-dtype fp8 --enable-prefix-caching \
+  --mamba-cache-mode all --mamba-block-size 256 \
+  --gpu-memory-utilization 0.87 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --download-dir /workspace/models --host 127.0.0.1 --port 18000 \
+  --speculative-config '{"model":"chankhavu/c2.eagle3-test","method":"eagle3","num_speculative_tokens":5}'
+```
+
+`gpu_memory_utilization=0.87` (rather than 0.9) leaves headroom for
+FlashInfer workspace + cudagraph capture buffers, which lazy-grow ~5 GB
+on top of the budgeted KV pool. The original 0.9 OOMs under load.
+Always set client `max_parallel <= server max_num_seqs` (1:1 is safe);
+oversubscription triggers a thundering-herd race in the spec slot init
+path that produces degenerate output (unbalanced tool-call closing
+tags) — see the `failure_patterns.md` runlog for the investigation.
+
+---
+
+## TL;DR — 2026-04-11 (pre-fix, max_num_seqs=16 workaround)
 
 All three success criteria **PASS** on the 94 GB Blackwell RTX PRO 6000:
 
