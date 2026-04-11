@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.request import Request
 
@@ -494,11 +495,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             self.attention_groups[0][0], FullAttentionSpec
         )
 
+        # Apply the Eagle last-block drop only to the drafter's SlidingWindow
+        # group. On hybrid models the target-side LCM block inflates to
+        # thousands of tokens; dropping one would wipe the entire cache hit,
+        # and max_cache_hit_length = num_tokens - 1 already forces last-token
+        # recompute on the target side.
         while True:
             curr_hit_length = hit_length
 
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
+                is_sliding_window = isinstance(spec, SlidingWindowSpec)
+                use_eagle_here = self.use_eagle and is_sliding_window
 
                 # Full attention: reuse cached blocks (downward-closed property)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
@@ -517,10 +525,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_group_ids=group_ids,
                         block_pool=self.block_pool,
                         kv_cache_spec=spec,
-                        use_eagle=self.use_eagle,
+                        use_eagle=use_eagle_here,
                         alignment_tokens=self.lcm_block_size,
                     )
-                    curr_hit_length = len(hit_blocks[0]) * spec.block_size
+                    # Drafter group's reduced hit length must not cascade
+                    # to target model groups.
+                    if not is_sliding_window:
+                        curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
                         hit_blocks_by_group[group_id] = blocks
 
