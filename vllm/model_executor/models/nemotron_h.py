@@ -63,9 +63,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMambaPrefixCaching,
     SupportsPP,
@@ -559,7 +561,7 @@ ALL_DECODER_LAYER_TYPES = {
 
 
 @support_torch_compile
-class NemotronHModel(nn.Module):
+class NemotronHModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -625,11 +627,22 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # Eagle3 aux-layer indices are absolute (SpecForge convention), not
+        # Llama's embedding-offset convention; capture with idx + start_layer.
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states,
+                idx + self.start_layer,
+                hidden_states,
+                residual,
             )
 
         if not get_pp_group().is_last_rank:
@@ -637,6 +650,8 @@ class NemotronHModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def is_spec_layer(self, config: NemotronHConfig, weight_name: str) -> bool:
@@ -791,6 +806,7 @@ class NemotronHForCausalLM(
     SupportsQuant,
     MixtureOfExperts,
     SupportsMambaPrefixCaching,
+    SupportsEagle3,
 ):
     # Relevant only if self.has_moe is True
     is_non_gated_moe: bool = True
@@ -931,6 +947,17 @@ class NemotronHForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 auxiliary hidden state layer indices for NemotronH.
+
+        Uses SpecForge's convention (`layers[k]` for an absolute layer
+        index `k`) and falls back on its default
+        `[1, num_layers // 2 - 1, num_layers - 4]` if the draft config does
+        not specify `eagle_aux_hidden_state_layer_ids`.
+        """
+        num_layers = len(self.model.layers)
+        return (1, num_layers // 2 - 1, num_layers - 4)
 
     def forward(
         self,
