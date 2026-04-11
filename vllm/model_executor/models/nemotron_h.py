@@ -627,17 +627,8 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # Eagle-3 auxiliary hidden state collection.
-        #
-        # SpecForge (the canonical EAGLE-3 training framework) captures the
-        # output of the verifier's transformer layers via a `register_forward_hook`
-        # on `layers[idx]`. So in SpecForge convention, the layer index `k` in
-        # `eagle_aux_hidden_state_layer_ids` refers directly to the absolute
-        # layer index in `model.backbone.layers` of the verifier (no embedding
-        # offset). For NemotronH (whose draft heads are trained with the
-        # `nemotron-cascade-2-experiments` SpecForge fork) we therefore match
-        # this convention exactly: we capture using the absolute layer index
-        # `idx + self.start_layer`, NOT the off-by-one Llama convention.
+        # Eagle3 aux-layer indices are absolute (SpecForge convention), not
+        # Llama's embedding-offset convention; capture with idx + start_layer.
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
