@@ -14,6 +14,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -52,6 +53,9 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
+
+logger = init_logger(__name__)
+_PC_SPEC_WARNED = False
 
 # Added by the IBM Team, 2024
 
@@ -497,6 +501,28 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         self.num_spec = vllm_config.num_speculative_tokens
 
+        # With prefix caching + spec decode, route both SSM and conv kernels
+        # through dedicated per-request spec slots (non-APC mode).
+        self._pc_spec_enabled = (
+            self.num_spec > 0
+            and self.cache_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+        )
+        self.spec_ssm: torch.Tensor | None = None
+        self.spec_conv: torch.Tensor | None = None
+        self._spec_slot_ids: torch.Tensor | None = None
+        if self._pc_spec_enabled:
+            self._spec_max_seqs = vllm_config.scheduler_config.max_num_seqs
+            self._spec_slots_per_req = 1 + self.num_spec
+            global _PC_SPEC_WARNED
+            if not _PC_SPEC_WARNED:
+                _PC_SPEC_WARNED = True
+                logger.warning(
+                    "PC + spec decode: using K+1=%d dedicated spec slots "
+                    "per request (non-APC mode for both SSM and conv).",
+                    self._spec_slots_per_req,
+                )
+
         # Pre-compute sizes for forward pass
         self.tped_intermediate_size = self.intermediate_size // self.tp_size
         self.tped_conv_size = self.conv_dim // self.tp_size
@@ -824,37 +850,102 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
-            if is_mamba_cache_all:
+            # Under PC + spec decode, route both kernels through dedicated
+            # per-request spec slots with native init_token_idx rollback.
+            use_spec_slots = (
+                is_mamba_cache_all
+                and self._pc_spec_enabled
+                and num_accepted_tokens is not None
+                and self.spec_ssm is not None
+            )
+
+            if use_spec_slots:
+                spec_ids = self._spec_slot_ids[:num_decodes]
+                base_long = self._spec_base_long[:num_decodes]
+                spec_conv_view = (
+                    self.spec_conv if is_conv_state_dim_first()
+                    else self.spec_conv.transpose(-1, -2))
+
+                # One-time copy from pool into spec slots on first decode
+                # step of a request (detected via _spec_inited).
+                needs_init = ~self._spec_inited[:num_decodes]
+                if needs_init.any():
+                    init_idx = needs_init.nonzero(as_tuple=True)[0]
+                    canonical = state_indices_tensor_d.gather(
+                        1, block_idx_last_computed_token_d.unsqueeze(1)
+                    ).squeeze(1).long()
+                    init_bases = base_long[init_idx]
+                    init_canon = canonical[init_idx]
+                    self.spec_ssm.index_copy_(
+                        0, init_bases,
+                        ssm_state.index_select(0, init_canon))
+                    spec_conv_view.index_copy_(
+                        0, init_bases,
+                        conv_state.index_select(0, init_canon))
+                    self._spec_inited[init_idx] = True
+
+                state_indices_tensor_d_input = spec_ids
+                state_indices_tensor_d_output = spec_ids
+                ssm_state_for_kernel = self.spec_ssm
+                conv_state_for_kernel = spec_conv_view
+                conv_indices = spec_ids
+                conv_blk_last_sched = None  # IS_APC_ENABLED=False
+                conv_init_idx = None
+                conv_max_query_len = self._spec_slots_per_req
+
+                # Clone before stashing: in cudagraph mode these are views
+                # of persistent metadata buffers that the next step's
+                # _prepare_inputs will overwrite before commit reads them.
+                # num_computed_d is computed on-GPU to dodge the async
+                # CPU-side race on num_computed_tokens_cpu_tensor.
+                num_computed_d = (
+                    attn_metadata.seq_lens[:num_decodes]
+                    - (query_start_loc_d[1:] - query_start_loc_d[:-1])
+                    if query_start_loc_d is not None
+                    else attn_metadata.seq_lens[:num_decodes] - 1
+                )
+                self._spec_pending = (
+                    state_indices_tensor_d.clone(),
+                    block_idx_last_computed_token_d.clone(),
+                    num_computed_d.clone(),
+                )
+
+            elif is_mamba_cache_all:
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
                     1, block_idx_last_computed_token_d.unsqueeze(1)
                 ).squeeze(1)
                 state_indices_tensor_d_output = state_indices_tensor_d.gather(
                     1, block_idx_last_scheduled_token_d.unsqueeze(1)
                 ).squeeze(1)
-                # for decode:
-                #   block_idx_first_scheduled_token_d ==
-                #       block_idx_last_scheduled_token_d
-                # at block boundaries:
-                #   block_idx_first_scheduled_token_d >
-                #       block_idx_last_computed_token_d
+                ssm_state_for_kernel = ssm_state
+                conv_state_for_kernel = conv_state
+                conv_indices = state_indices_tensor_d
+                conv_blk_last_sched = block_idx_last_scheduled_token_d
+                conv_init_idx = block_idx_last_computed_token_d
+                conv_max_query_len = state_indices_tensor_d.size(-1)
             else:
-                # Without caching, read and write in-place to the same blocks:
                 state_indices_tensor_d_input = state_indices_tensor_d
                 state_indices_tensor_d_output = state_indices_tensor_d
+                ssm_state_for_kernel = ssm_state
+                conv_state_for_kernel = conv_state
+                conv_indices = state_indices_tensor_d
+                conv_blk_last_sched = block_idx_last_scheduled_token_d
+                conv_init_idx = block_idx_last_computed_token_d
+                conv_max_query_len = state_indices_tensor_d.size(-1)
 
             # 2. Convolution sequence transformation
             hidden_states_B_C_d = causal_conv1d_update(
                 hidden_states_B_C_d,
-                conv_state,
+                conv_state_for_kernel,
                 self.conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=state_indices_tensor_d,
-                block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
-                initial_state_idx=block_idx_last_computed_token_d,
+                conv_state_indices=conv_indices,
+                block_idx_last_scheduled_token=conv_blk_last_sched,
+                initial_state_idx=conv_init_idx,
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
-                max_query_len=state_indices_tensor_d.size(-1),
+                max_query_len=conv_max_query_len,
             )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
@@ -879,11 +970,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             assert preallocated_ssm_out_d is not None
             # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - mamba_cache_params.ssm_state's slots will be selected
-            #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
             selective_state_update(
-                ssm_state,
+                ssm_state_for_kernel,
                 hidden_states_d,
                 dt_d,
                 A_d,
@@ -902,6 +991,89 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 enable_stochastic_rounding=self.cache_config.enable_mamba_cache_stochastic_rounding,
                 cache_philox_rounds=self.cache_config.mamba_cache_philox_rounds,
             )
+
+    def init_spec_slots(self, conv_state: torch.Tensor, ssm_state: torch.Tensor):
+        """Allocate M*(K+1)+1 dedicated spec slots for SSM and conv. Slot 0
+        is NULL_BLOCK_ID. Called once from gpu_model_runner after
+        bind_kv_cache."""
+        M = self._spec_max_seqs
+        S = self._spec_slots_per_req
+        total = M * S + 1
+        device = ssm_state.device
+
+        def _strided(pool: torch.Tensor) -> torch.Tensor:
+            # The SSM/conv kernels read stride(0) off the tensor for pointer
+            # arithmetic, so the spec tensor must reuse the pool's page-padded
+            # stride; a contiguous allocation OOBs under cudagraph replay.
+            shape = pool.shape[1:]
+            page_el = pool.stride(0)
+            inner_s = torch.empty(shape).stride()
+            raw = torch.zeros(total * page_el, dtype=pool.dtype, device=device)
+            return torch.as_strided(raw, (total, *shape), (page_el, *inner_s), 0)
+
+        self.spec_ssm = _strided(ssm_state)
+        self.spec_conv = _strided(conv_state)
+
+        bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * S
+        offsets = torch.arange(S, device=device, dtype=torch.int32)
+        self._spec_slot_ids = (bases.unsqueeze(1) + offsets.unsqueeze(0)).contiguous()
+        self._spec_base_long = bases.long().contiguous()
+        self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
+
+    def commit_boundary_states(self, num_accepted: torch.Tensor,
+                                block_size: int):
+        """After the rejection sampler, copy spec slot state back to the pool
+        for any request whose accepted tokens crossed a mamba block boundary."""
+        if not self._pc_spec_enabled or self.spec_ssm is None:
+            return
+        if not hasattr(self, '_spec_pending') or self._spec_pending is None:
+            return
+
+        state_indices_d, blk_idx_last_computed, num_computed_d = (
+            self._spec_pending)
+        # _spec_pending is populated for decodes only; num_accepted covers
+        # [decodes, prefills] so slice to num_decodes = state_indices_d.shape[0].
+        N = state_indices_d.shape[0]
+        n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
+        n_acc = num_accepted[:N]
+
+        # Commit when the next-to-be-generated token would land in a new
+        # block, i.e. when the accepted tokens either cross a boundary or
+        # sit exactly at one. Using blk_after = (n_done + n_acc) // block_size
+        # (rather than n_done + n_acc - 1) folds the at-boundary case into
+        # the crossed-past check: otherwise the boundary state would sit in
+        # the spec slot and be overwritten by the next step.
+        blk_before = (n_done - 1).clamp(min=0) // block_size
+        blk_after = (n_done + n_acc) // block_size
+        needs_commit = blk_after > blk_before
+
+        if not needs_commit.any():
+            self._spec_pending = None
+            return
+
+        boundary_pos = (blk_before + 1) * block_size - 1
+        cand_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
+        base = self._spec_base_long[:N]
+        src_slot = base + cand_idx.long()
+        pool_slot = state_indices_d.gather(
+            1, blk_idx_last_computed.unsqueeze(1)
+        ).squeeze(1).long()
+
+        ix = needs_commit.nonzero(as_tuple=True)[0]
+        if ix.numel() > 0:
+            self.kv_cache[1].index_copy_(
+                0, pool_slot[ix],
+                self.spec_ssm.index_select(0, src_slot[ix]))
+            pool_conv = self.kv_cache[0]
+            spec_conv = self.spec_conv
+            if not is_conv_state_dim_first():
+                pool_conv = pool_conv.transpose(-1, -2)
+                spec_conv = spec_conv.transpose(-1, -2)
+            pool_conv.index_copy_(
+                0, pool_slot[ix],
+                spec_conv.index_select(0, src_slot[ix]))
+
+        self._spec_pending = None
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None

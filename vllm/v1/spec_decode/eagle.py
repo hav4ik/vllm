@@ -530,6 +530,12 @@ class SpecDecodeBaseProposer:
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
+        # seq_lens is a view of gpu_model_runner.self.seq_lens and is mutated
+        # in-place both by -= num_rejected_tokens_gpu and by
+        # eagle_step_update_slot_mapping_and_metadata (+=1 per iteration);
+        # clone to isolate the target model's state.
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
         # Only apply this adjustment when we have rejected tokens

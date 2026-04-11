@@ -416,6 +416,10 @@ class GPUModelRunner(
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
 
+        # Populated after bind_kv_cache by initialize_kv_cache(); empty until
+        # then. Used by the Mamba2 PC + spec decode lifecycle hooks.
+        self._pc_spec_layers: list = []
+
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
@@ -648,9 +652,15 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
+        # cuda event to ensure sample_tokens() GPU work (commit +
+        # drafter) completes before the next step's model forward
+        # reads from the mamba state pool. With async batch queue,
+        # sample_tokens(N) can overlap with execute_model(N+1).
+        self.sample_complete_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
+            self.sample_complete_event = torch.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -1076,6 +1086,16 @@ class GPUModelRunner(
         # then resubmitted with the same ID. In this case, we treat them as two
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
+        # Reset spec-slot init flags so a batch position freed by a finished
+        # request is re-initialized on the next request's first decode step.
+        if self._pc_spec_layers and scheduler_output.finished_req_ids:
+            for req_id in scheduler_output.finished_req_ids:
+                batch_idx = self.input_batch.req_id_to_index.get(req_id)
+                if batch_idx is not None:
+                    for layer in self._pc_spec_layers:
+                        if layer._spec_inited is not None:
+                            layer._spec_inited[batch_idx] = False
+
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -1356,7 +1376,38 @@ class GPUModelRunner(
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
+        num_moved_before_condense = (
+            len(self.input_batch.batch_update_builder.moved)
+            if self._pc_spec_layers else 0
+        )
         self.input_batch.condense()
+
+        # Rearrange mamba spec slots for any requests that condense moved.
+        # batch_update_builder.moved is the canonical move log; slice off the
+        # moves appended during this condense() call (the prefix was from
+        # add/swap operations already reflected in prior state).
+        if self._pc_spec_layers:
+            new_moves = self.input_batch.batch_update_builder.moved[
+                num_moved_before_condense:
+            ]
+            if new_moves:
+                for layer in self._pc_spec_layers:
+                    if layer.spec_ssm is None:
+                        continue
+                    S = layer._spec_slots_per_req
+                    for old_pos, new_pos, _direction in new_moves:
+                        old_base = 1 + old_pos * S
+                        new_base = 1 + new_pos * S
+                        old_slots = slice(old_base, old_base + S)
+                        new_slots = slice(new_base, new_base + S)
+                        layer.spec_ssm[new_slots] = (
+                            layer.spec_ssm[old_slots].clone())
+                        layer.spec_conv[new_slots] = (
+                            layer.spec_conv[old_slots].clone())
+                        layer._spec_inited[new_pos] = (
+                            layer._spec_inited[old_pos])
+                        layer._spec_inited[old_pos] = False
+
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
@@ -1467,6 +1518,13 @@ class GPUModelRunner(
             )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
+
+            # PC + spec: commit boundary states from spec slots → pool.
+            if self._pc_spec_layers:
+                num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
+                bs = self.cache_config.mamba_block_size
+                for layer in self._pc_spec_layers:
+                    layer.commit_boundary_states(num_accepted_gpu, bs)
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -3812,6 +3870,8 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # Ensure all GPU work from the previous step (including spec
+        # decode side-stream copies) is complete before modifying
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4035,6 +4095,12 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Wait for the previous step's sample_tokens() GPU work
+            # (commit_boundary_states, drafter) to complete before
+            # the model forward reads from the mamba state pool.
+            if self.sample_complete_event is not None:
+                self.sample_complete_event.synchronize()
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4336,6 +4402,15 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+
+
+        # Record event after all GPU work in sample_tokens()
+        # (commit_boundary_states, drafter, bookkeeping) so the
+        # next step's execute_model() can wait on it before reading
+        # the mamba state pool. With the async batch queue,
+        # sample_tokens(N) overlaps with execute_model(N+1).
+        if self.sample_complete_event is not None:
+            self.sample_complete_event.record()
 
         if not self.use_async_scheduling:
             return output
@@ -4921,6 +4996,12 @@ class GPUModelRunner(
         hf_config = self.speculative_config.draft_model_config.hf_config
 
         layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            # SpecForge stores the layer ids nested under `eagle_config`
+            # (a dict on the draft hf_config). Support both layouts.
+            eagle_config = getattr(hf_config, "eagle_config", None)
+            if isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
         if not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
             if dflash_config and isinstance(dflash_config, dict):
@@ -6703,6 +6784,20 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+
+        # Cache the list of MambaMixer2 layers that need spec slots for
+        # PC + spec decode, then initialize them. Pre-caching avoids
+        # walking the static_forward_context on every decode step.
+        from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+        self._pc_spec_layers: list[MambaMixer2] = [
+            layer
+            for layer in self.compilation_config.static_forward_context.values()
+            if isinstance(layer, MambaMixer2) and layer._pc_spec_enabled
+        ]
+        for layer in self._pc_spec_layers:
+            if layer.spec_ssm is None:
+                layer.init_spec_slots(layer.kv_cache[0], layer.kv_cache[1])
+
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
