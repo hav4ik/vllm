@@ -416,6 +416,10 @@ class GPUModelRunner(
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
 
+        # Populated after bind_kv_cache by initialize_kv_cache(); empty until
+        # then. Used by the Mamba2 PC + spec decode lifecycle hooks.
+        self._pc_spec_layers: list = []
+
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
@@ -1075,22 +1079,14 @@ class GPUModelRunner(
         # then resubmitted with the same ID. In this case, we treat them as two
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
-        # Reset spec slot init flags for finished requests (so the
-        # batch position can be reused by a new request with fresh init).
-        if (self.speculative_config is not None
-            and self.cache_config.mamba_cache_mode == "all"
-            and scheduler_output.finished_req_ids):
-            from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-                MambaMixer2)
+        # Reset spec-slot init flags so a batch position freed by a finished
+        # request is re-initialized on the next request's first decode step.
+        if self._pc_spec_layers and scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 batch_idx = self.input_batch.req_id_to_index.get(req_id)
                 if batch_idx is not None:
-                    for layer in (
-                        self.compilation_config.static_forward_context.values()
-                    ):
-                        if (isinstance(layer, MambaMixer2)
-                            and getattr(layer, "_pc_spec_enabled", False)
-                            and layer._spec_inited is not None):
+                    for layer in self._pc_spec_layers:
+                        if layer._spec_inited is not None:
                             layer._spec_inited[batch_idx] = False
 
         for req_id in scheduler_output.finished_req_ids:
@@ -1373,46 +1369,37 @@ class GPUModelRunner(
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
-        # Save pre-condense req_id→index mapping for spec slot rearrangement
-        _pre_condense_mapping = None
-        if (self.speculative_config is not None
-            and self.cache_config.mamba_cache_mode == "all"):
-            _pre_condense_mapping = dict(self.input_batch.req_id_to_index)
+        num_moved_before_condense = (
+            len(self.input_batch.batch_update_builder.moved)
+            if self._pc_spec_layers else 0
+        )
         self.input_batch.condense()
 
-        # Rearrange mamba spec slot data after condense
-        if _pre_condense_mapping is not None:
-            from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-            post_mapping = self.input_batch.req_id_to_index
-            # Find requests that moved positions
-            moves = []  # (old_pos, new_pos)
-            for req_id, new_pos in post_mapping.items():
-                old_pos = _pre_condense_mapping.get(req_id)
-                if old_pos is not None and old_pos != new_pos:
-                    moves.append((old_pos, new_pos))
-            if moves:
-                for layer in (
-                    self.compilation_config.static_forward_context.values()
-                ):
-                    if (isinstance(layer, MambaMixer2)
-                        and getattr(layer, "_pc_spec_enabled", False)
-                        and layer.spec_ssm is not None):
-                        K1 = layer._spec_K1
-                        for old_pos, new_pos in moves:
-                            old_base = 1 + old_pos * K1
-                            new_base = 1 + new_pos * K1
-                            old_slots = slice(old_base, old_base + K1)
-                            new_slots = slice(new_base, new_base + K1)
-                            # Copy SSM spec data
-                            layer.spec_ssm[new_slots] = (
-                                layer.spec_ssm[old_slots].clone())
-                            # Copy conv spec data
-                            layer.spec_conv[new_slots] = (
-                                layer.spec_conv[old_slots].clone())
-                            # Move init flag
-                            layer._spec_inited[new_pos] = (
-                                layer._spec_inited[old_pos])
-                            layer._spec_inited[old_pos] = False
+        # Rearrange mamba spec slots for any requests that condense moved.
+        # batch_update_builder.moved is the canonical move log; slice off the
+        # moves appended during this condense() call (the prefix was from
+        # add/swap operations already reflected in prior state).
+        if self._pc_spec_layers:
+            new_moves = self.input_batch.batch_update_builder.moved[
+                num_moved_before_condense:
+            ]
+            if new_moves:
+                for layer in self._pc_spec_layers:
+                    if layer.spec_ssm is None:
+                        continue
+                    K1 = layer._spec_K1
+                    for old_pos, new_pos, _direction in new_moves:
+                        old_base = 1 + old_pos * K1
+                        new_base = 1 + new_pos * K1
+                        old_slots = slice(old_base, old_base + K1)
+                        new_slots = slice(new_base, new_base + K1)
+                        layer.spec_ssm[new_slots] = (
+                            layer.spec_ssm[old_slots].clone())
+                        layer.spec_conv[new_slots] = (
+                            layer.spec_conv[old_slots].clone())
+                        layer._spec_inited[new_pos] = (
+                            layer._spec_inited[old_pos])
+                        layer._spec_inited[old_pos] = False
 
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
@@ -1525,20 +1512,12 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
-            # PC + spec: commit boundary states from spec slots → pool
-            if (self.speculative_config is not None
-                and self.cache_config.mamba_cache_mode == "all"):
-                from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-                    MambaMixer2)
+            # PC + spec: commit boundary states from spec slots → pool.
+            if self._pc_spec_layers:
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
                 bs = self.cache_config.mamba_block_size
-                for layer in (
-                    self.compilation_config.static_forward_context.values()
-                ):
-                    if isinstance(layer, MambaMixer2) and getattr(
-                        layer, "_pc_spec_enabled", False):
-                        layer.commit_boundary_states(
-                            num_accepted_gpu, bs)
+                for layer in self._pc_spec_layers:
+                    layer.commit_boundary_states(num_accepted_gpu, bs)
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -6874,12 +6853,18 @@ class GPUModelRunner(
             num_attn_module,
         )
 
-        # Init spec slots for PC + spec decode
+        # Cache the list of MambaMixer2 layers that need spec slots for
+        # PC + spec decode, then initialize them. Pre-caching avoids
+        # walking the static_forward_context on every decode step.
         from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-        for layer in self.compilation_config.static_forward_context.values():
-            if (isinstance(layer, MambaMixer2)
-                and getattr(layer, "_pc_spec_enabled", False)
-                and layer.spec_ssm is None):
+        self._pc_spec_layers: list[MambaMixer2] = [
+            layer
+            for layer in self.compilation_config.static_forward_context.values()
+            if isinstance(layer, MambaMixer2)
+            and getattr(layer, "_pc_spec_enabled", False)
+        ]
+        for layer in self._pc_spec_layers:
+            if layer.spec_ssm is None:
                 layer.init_spec_slots(layer.kv_cache[0], layer.kv_cache[1])
 
         return kv_caches

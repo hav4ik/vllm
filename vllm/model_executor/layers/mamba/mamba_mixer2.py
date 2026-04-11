@@ -496,9 +496,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         self.num_spec = vllm_config.num_speculative_tokens
 
-        # PC + Spec decode: dedicated K+1 spec slots per request.
-        # Both SSM and conv kernels use these slots (non-APC mode).
-        # This makes the decode path identical to the non-PC path.
+        # With prefix caching + spec decode, route both SSM and conv kernels
+        # through dedicated per-request spec slots (non-APC mode).
         self._pc_spec_enabled = (
             self.num_spec > 0
             and self.cache_config is not None
@@ -846,9 +845,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
-            # PC + Spec decode: use dedicated spec slots for BOTH
-            # SSM and conv (non-APC mode, native kernel rollback).
-            # This makes the decode path identical to the non-PC path.
+            # Under PC + spec decode, route both kernels through dedicated
+            # per-request spec slots with native init_token_idx rollback.
             use_spec_slots = (
                 is_mamba_cache_all
                 and self._pc_spec_enabled
@@ -859,16 +857,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
             if use_spec_slots:
                 spec_ids = self._spec_slot_ids[:num_decodes]
                 base_long = self._spec_base_long[:num_decodes]
-
-                # Init spec slots from pool ONCE per request (first
-                # decode step after prefill). Detected via _spec_inited
-                # flag per batch position.
-                # Conv spec view (needed for kernel call below)
                 spec_conv_view = (
                     self.spec_conv if is_conv_state_dim_first()
                     else self.spec_conv.transpose(-1, -2))
 
-                # One-time init from pool for new requests
+                # One-time copy from pool into spec slots on first decode
+                # step of a request (detected via _spec_inited).
                 needs_init = ~self._spec_inited[:num_decodes]
                 if needs_init.any():
                     init_idx = needs_init.nonzero(as_tuple=True)[0]
@@ -877,34 +871,28 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     ).squeeze(1).long()
                     init_bases = base_long[init_idx]
                     init_canon = canonical[init_idx]
-                    # SSM
                     self.spec_ssm.index_copy_(
                         0, init_bases,
                         ssm_state.index_select(0, init_canon))
-                    # Conv
                     spec_conv_view.index_copy_(
                         0, init_bases,
                         conv_state.index_select(0, init_canon))
                     self._spec_inited[init_idx] = True
 
-                # SSM kernel uses spec slots
                 state_indices_tensor_d_input = spec_ids
                 state_indices_tensor_d_output = spec_ids
                 ssm_state_for_kernel = self.spec_ssm
-
-                # Conv kernel uses spec slots (non-APC mode)
                 conv_state_for_kernel = spec_conv_view
                 conv_indices = spec_ids
                 conv_blk_last_sched = None  # IS_APC_ENABLED=False
                 conv_init_idx = None
                 conv_max_query_len = self._spec_K1
 
-                # Stash for boundary commit.  Clone because in
-                # cudagraph mode these are views of persistent
-                # buffers that get overwritten by the next metadata
-                # build.  Also stash GPU-computed num_computed_d
-                # (seq_lens - query_lens for decode requests) so the
-                # commit doesn't need the CPU tensor (async race).
+                # Clone before stashing: in cudagraph mode these are views
+                # of persistent metadata buffers that the next step's
+                # _prepare_inputs will overwrite before commit reads them.
+                # num_computed_d is computed on-GPU to dodge the async
+                # CPU-side race on num_computed_tokens_cpu_tensor.
                 num_computed_d = (
                     attn_metadata.seq_lens[:num_decodes]
                     - (query_start_loc_d[1:] - query_start_loc_d[:-1])
@@ -1000,68 +988,37 @@ class MambaMixer2(MambaBase, PluggableLayer):
             )
 
     def init_spec_slots(self, conv_state: torch.Tensor, ssm_state: torch.Tensor):
-        """Allocate K+1 dedicated spec slots for both SSM and conv.
-        Called from gpu_model_runner after bind_kv_cache."""
+        """Allocate M*(K+1)+1 dedicated spec slots for SSM and conv. Slot 0
+        is NULL_BLOCK_ID. Called once from gpu_model_runner after
+        bind_kv_cache."""
         M = self._spec_max_seqs
         K1 = self._spec_K1
-        total = M * K1 + 1  # +1 for NULL_BLOCK_ID at slot 0
+        total = M * K1 + 1
         device = ssm_state.device
 
-        # SSM spec slots — match pool's page-padded stride
-        ssm_shape = ssm_state.shape[1:]
-        page_el = ssm_state.stride(0)
-        inner_s = torch.empty(ssm_shape).stride()
-        raw_ssm = torch.zeros(total * page_el, dtype=ssm_state.dtype, device=device)
-        self.spec_ssm = torch.as_strided(
-            raw_ssm, (total, *ssm_shape), (page_el, *inner_s), 0)
+        def _strided(pool: torch.Tensor) -> torch.Tensor:
+            # The SSM/conv kernels read stride(0) off the tensor for pointer
+            # arithmetic, so the spec tensor must reuse the pool's page-padded
+            # stride; a contiguous allocation OOBs under cudagraph replay.
+            shape = pool.shape[1:]
+            page_el = pool.stride(0)
+            inner_s = torch.empty(shape).stride()
+            raw = torch.zeros(total * page_el, dtype=pool.dtype, device=device)
+            return torch.as_strided(raw, (total, *shape), (page_el, *inner_s), 0)
 
-        # Conv spec slots — must use PAGE-PADDED stride matching
-        # the pool. The conv kernel reads stride[0] from the tensor
-        # for pointer arithmetic. Contiguous strides cause wrong
-        # memory offsets and OOB access under cudagraph replay.
-        conv_shape = conv_state.shape[1:]
-        conv_page_el = conv_state.stride(0)
-        conv_inner_s = torch.empty(conv_shape).stride()
-        raw_conv = torch.zeros(total * conv_page_el,
-                               dtype=conv_state.dtype, device=device)
-        self.spec_conv = torch.as_strided(
-            raw_conv, (total, *conv_shape),
-            (conv_page_el, *conv_inner_s), 0)
+        self.spec_ssm = _strided(ssm_state)
+        self.spec_conv = _strided(conv_state)
 
-        # Pre-computed slot IDs: spec_slot_ids[i][j] = 1 + i*K1 + j
         bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * K1
         offsets = torch.arange(K1, device=device, dtype=torch.int32)
         self._spec_slot_ids = (bases.unsqueeze(1) + offsets.unsqueeze(0)).contiguous()
         self._spec_base_long = bases.long().contiguous()
-        # Per-batch-position flag: True if spec slots have been
-        # initialized from the pool. Reset when request leaves.
         self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
-
-    def init_spec_from_pool(self, req_indices: torch.Tensor,
-                            canonical_slots: torch.Tensor):
-        """One-time init: copy pool state → spec[base+0] for new requests.
-        Called from gpu_model_runner when requests transition prefill→decode."""
-        if self.spec_ssm is None:
-            return
-        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
-        base = self._spec_base_long[req_indices]
-        # SSM
-        self.spec_ssm.index_copy_(
-            0, base,
-            self.kv_cache[1].index_select(0, canonical_slots.long()))
-        # Conv (with layout)
-        spec_cv = (self.spec_conv if is_conv_state_dim_first()
-                   else self.spec_conv.transpose(-1, -2))
-        pool_cv = (self.kv_cache[0] if is_conv_state_dim_first()
-                   else self.kv_cache[0].transpose(-1, -2))
-        spec_cv.index_copy_(
-            0, base,
-            pool_cv.index_select(0, canonical_slots.long()))
 
     def commit_boundary_states(self, num_accepted: torch.Tensor,
                                 block_size: int):
-        """At block boundaries, copy spec slot states → pool block slots.
-        Called from gpu_model_runner after rejection sampler."""
+        """After the rejection sampler, copy spec slot state back to the pool
+        for any request whose accepted tokens crossed a mamba block boundary."""
         if not self._pc_spec_enabled or self.spec_ssm is None:
             return
         if not hasattr(self, '_spec_pending') or self._spec_pending is None:
@@ -1069,24 +1026,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         state_indices_d, blk_idx_last_computed, num_computed_d = (
             self._spec_pending)
-        # _spec_pending was set for decode requests only
-        # (state_indices_d has num_decodes rows).  The caller passes
-        # num_accepted for ALL requests (decode first, then prefill).
-        # We must slice to num_decodes to match dimensions; prefill
-        # requests don't have spec slots.
-        N = state_indices_d.shape[0]  # = num_decodes
+        # _spec_pending is populated for decodes only; num_accepted covers
+        # [decodes, prefills] so slice to num_decodes = state_indices_d.shape[0].
+        N = state_indices_d.shape[0]
         n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
         n_acc = num_accepted[:N]
 
         blk_before = (n_done - 1).clamp(min=0) // block_size
         blk_after = (n_done + n_acc - 1) // block_size
 
-        # Detect boundary commits in two cases:
-        # 1. Crossed into a new block (tokens accepted past boundary)
-        # 2. Last accepted token lands exactly on a boundary position
-        #    (e.g. position 4607 with block_size=4608). Without this,
-        #    the boundary state would sit in scratch and be overwritten
-        #    by the next step's kernel before ever reaching the pool.
+        # Commit when accepted tokens cross OR land on a block boundary.
+        # The at_boundary case (last token at pos block_size - 1) also needs
+        # a commit: otherwise the boundary state sits in the spec slot and
+        # gets overwritten by the next step before reaching the pool.
         crossed_past = (blk_before != blk_after)
         last_accepted_pos = n_done + n_acc - 1
         at_boundary = (last_accepted_pos % block_size == block_size - 1)
@@ -1096,32 +1048,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self._spec_pending = None
             return
 
-        # Boundary position = last token of the current (old) block.
-        # For crossed_past: this is the end of blk_before.
-        # For at_boundary (not crossed): this equals last_accepted_pos.
-        # Both formulas produce the same value in the at_boundary case
-        # because last_accepted_pos = blk_before * block_size + block_size - 1
-        # = (blk_before + 1) * block_size - 1.
         boundary_pos = (blk_before + 1) * block_size - 1
-        # Which candidate has the boundary state
         cand_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
-
-        # Scratch slot for boundary state
         base = self._spec_base_long[:N]
         src_slot = base + cand_idx.long()
-
-        # Pool slot for the block containing the boundary
         pool_slot = state_indices_d.gather(
             1, blk_idx_last_computed.unsqueeze(1)
         ).squeeze(1).long()
 
         ix = needs_commit.nonzero(as_tuple=True)[0]
         if ix.numel() > 0:
-            # Commit SSM boundary state
             self.kv_cache[1].index_copy_(
                 0, pool_slot[ix],
                 self.spec_ssm.index_select(0, src_slot[ix]))
-            # Commit conv boundary state (apply same transpose as pool)
             from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
             pool_conv = self.kv_cache[0]
             spec_conv = self.spec_conv

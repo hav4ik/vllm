@@ -530,20 +530,10 @@ class SpecDecodeBaseProposer:
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
-        # Clone seq_lens to avoid corrupting the shared self.seq_lens
-        # tensor in gpu_model_runner. The drafter modifies seq_lens
-        # in-place in two ways:
-        #   1. seq_lens -= num_rejected_tokens_gpu (below)
-        #   2. eagle_step_update_slot_mapping_and_metadata Triton kernel
-        #      writes seq_lens += 1 per iteration (line ~93 in utils.py)
-        # Since common_attn_metadata.seq_lens is a VIEW of the shared
-        # self.seq_lens GPU tensor, these in-place ops corrupt the
-        # model runner's state. With the async batch queue, the next
-        # step's _prepare_inputs may read the corrupted values, causing
-        # kernel index OOB (device-side assert).
-        #
-        # Cost: one clone of [batch_size] int32 per propose() call.
-        # E.g., 8 * 4 = 32 bytes. Negligible.
+        # seq_lens is a view of gpu_model_runner.self.seq_lens and is mutated
+        # in-place both by -= num_rejected_tokens_gpu and by
+        # eagle_step_update_slot_mapping_and_metadata (+=1 per iteration);
+        # clone to isolate the target model's state.
         common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
 
         # Also clone block_table_tensor — the drafter's Triton kernel
