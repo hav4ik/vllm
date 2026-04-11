@@ -996,18 +996,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
         total = M * S + 1
         device = ssm_state.device
 
-        def _strided(pool: torch.Tensor) -> torch.Tensor:
-            # The SSM/conv kernels read stride(0) off the tensor for pointer
-            # arithmetic, so the spec tensor must reuse the pool's page-padded
-            # stride; a contiguous allocation OOBs under cudagraph replay.
-            shape = pool.shape[1:]
-            page_el = pool.stride(0)
-            inner_s = torch.empty(shape).stride()
-            raw = torch.zeros(total * page_el, dtype=pool.dtype, device=device)
-            return torch.as_strided(raw, (total, *shape), (page_el, *inner_s), 0)
-
-        self.spec_ssm = _strided(ssm_state)
-        self.spec_conv = _strided(conv_state)
+        # Spec slots hold only the SSM/conv state per request, so allocate at
+        # the real state size — not the LCM-padded mamba_page_size the unified
+        # pool uses to share bytes with attention KV. The kernel reads
+        # stride(0) off this tensor for its own pointer arithmetic, which
+        # works as long as the spec tensor is internally consistent.
+        self.spec_ssm = torch.zeros(
+            (total, *ssm_state.shape[1:]),
+            dtype=ssm_state.dtype, device=device,
+        )
+        self.spec_conv = torch.zeros(
+            (total, *conv_state.shape[1:]),
+            dtype=conv_state.dtype, device=device,
+        )
 
         bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * S
         offsets = torch.arange(S, device=device, dtype=torch.int32)
