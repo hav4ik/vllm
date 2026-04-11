@@ -21,7 +21,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
-    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -496,41 +495,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             self.attention_groups[0][0], FullAttentionSpec
         )
 
-        # For hybrid models, skip the Eagle block drop for FullAttention
-        # and Mamba managers. The drop removes the last matched block to
-        # force hidden-state recomputation for Eagle's drafter. For
-        # transformer-only models (block_size=16), this is cheap. But for
-        # hybrid models, block alignment inflates block_size to the LCM
-        # of all attention types (e.g., 4608 tokens for NemotronH).
-        # Dropping one such block wipes out most or all cache hits.
-        #
-        # This is safe because KVCacheManager.get_computed_blocks()
-        # already sets max_cache_hit_length = num_tokens - 1, which
-        # guarantees at least the last token is always recomputed
-        # during prefill (producing the fresh hidden states Eagle needs).
-        #
-        # IMPORTANT: We still pass use_eagle=True to SlidingWindow
-        # managers (used by Eagle's drafter layers). The drafter needs
-        # the block drop for its own hidden-state recomputation.
-
+        # Apply the Eagle last-block drop only to the drafter's SlidingWindow
+        # group. On hybrid models the target-side LCM block inflates to
+        # thousands of tokens; dropping one would wipe the entire cache hit,
+        # and max_cache_hit_length = num_tokens - 1 already forces last-token
+        # recompute on the target side.
         while True:
             curr_hit_length = hit_length
 
             for spec, group_ids, manager_cls in self.attention_groups:
                 is_full_attn = isinstance(spec, FullAttentionSpec)
                 is_sliding_window = isinstance(spec, SlidingWindowSpec)
-
-                # Skip Eagle drop for FullAttention and Mamba (target
-                # model groups). The LCM-aligned block sizes make the
-                # drop too expensive — one 4608-token block drop wipes
-                # all cache hits. max_cache_hit_length = num_tokens - 1
-                # already ensures the last token is recomputed.
-                #
-                # Keep Eagle drop for SlidingWindow (drafter group).
-                # The drafter needs the drop for hidden-state recompute.
-                # But don't let its reduced hit length cascade to the
-                # target model groups — the drafter's cache is separate
-                # and should not constrain the target's cache hits.
                 use_eagle_here = self.use_eagle and is_sliding_window
 
                 # Full attention: reuse cached blocks (downward-closed property)
@@ -553,9 +528,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         use_eagle=use_eagle_here,
                         alignment_tokens=self.lcm_block_size,
                     )
-                    # Don't let the drafter's SlidingWindow group reduce
-                    # curr_hit_length. Its Eagle drop is necessary but
-                    # shouldn't cascade to the target model's groups.
+                    # Drafter group's reduced hit length must not cascade
+                    # to target model groups.
                     if not is_sliding_window:
                         curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
