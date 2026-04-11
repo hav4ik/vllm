@@ -311,14 +311,40 @@ Cloning additional tensors (block_table_tensor, slot_mapping,
 query_start_loc) did NOT help further — the 55K crash is a different
 issue from the seq_lens corruption.
 
-## Current status
+## Resolution (2026-04-11, commit 8546c2a71)
 
-The seq_lens clone significantly reduces the crash frequency.
-The remaining crash at ~55K gen tokens requires further investigation
-(possibly with CUDA compute-sanitizer or by identifying additional
-shared state that the drafter corrupts).
+The remaining ~55K-token crash was not in the drafter — it was in
+`MambaMixer2.commit_boundary_states`. Three independent bugs combined
+to produce the "only explodes with parallel + cudagraph + cache hits"
+symptom:
 
-For production use:
-- max_parallel=1 + enforce-eager: FULLY STABLE, all metrics good
-- max_parallel=4: survives ~55K tokens (~5 problems) with seq_lens clone
-- Full 30-problem eval: needs either max_parallel=1 or TP=2 setup
+1. **Piecewise-cudagraph buffer aliasing.** `_spec_pending` stashed
+   `state_indices_tensor_d` and `block_idx_last_computed_token_d`
+   *by reference*. In cudagraph mode these are views into persistent
+   metadata buffers that the next step overwrites before the commit
+   reads them. Fix: clone both tensors before stashing.
+
+2. **CPU-GPU race on `num_computed_tokens_cpu_tensor`.** The runner
+   copied this CPU tensor to the device at commit time. The scheduler
+   can update the CPU tensor between forward and commit, so the
+   commit would see values for the *next* step. Fix: compute
+   `num_computed_d = seq_lens - query_lens` on the GPU during forward
+   and stash it in `_spec_pending`; drop the CPU-tensor path from the
+   runner.
+
+3. **Dimension confusion in commit.** `commit_boundary_states` used
+   `N = num_accepted.shape[0]` (num_reqs) while `state_indices_d`
+   has num_decodes rows. When a cache-hit prefill request sat next
+   to a decode at a block boundary, the commit OOBed past
+   `pool_slot`. Fix: `N = state_indices_d.shape[0]`.
+
+With all three in place, **full 30-problem AIME-25 eval at
+max_parallel=4 + cudagraph PIECEWISE completes with zero crashes**,
+58/60 per-session accuracy, 79% prefix cache hit rate, 42% draft
+acceptance.
+
+### Pre-fix stable configurations (historical)
+
+- max_parallel=1 + enforce-eager: fully stable
+- max_parallel=4 + enforce-eager + no-cache-hit config: survives
+  ~55K gen tokens before the commit-time race/alias fires

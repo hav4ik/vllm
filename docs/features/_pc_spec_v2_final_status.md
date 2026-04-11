@@ -1,8 +1,72 @@
 # PC + Eagle3 Spec Decode: Final Status
 
 > Branch: `pc-spec-v2-nonpc-slots`
-> Date: 2026-04-10
-> Model: NemotronH (chankhavu/c2-softcpy-fp8) + Eagle3 drafter
+> Date: 2026-04-11 (superseded the 2026-04-10 "0% hits" version below)
+> Model: NemotronH (chankhavu/Nemotron-Cascade-2-30B-A3B-FP8)
+> Eagle3 drafter: chankhavu/c2.eagle3-test
+
+## TL;DR — 2026-04-11 update
+
+All three success criteria **PASS** on the 94 GB Blackwell RTX PRO 6000:
+
+| Criterion | Result |
+|---|---|
+| AIME-25 per-session accuracy | **58/60 = 96.7%** (>90% target) |
+| AIME-25 majority vote | **30/30 = 100%** |
+| Prefix cache hit rate (cumulative) | **4.37M / 5.51M = 79.4%** |
+| Eagle3 draft acceptance | **453k / 1.07M = 42.2%** |
+| `max_parallel=4` + cudagraph PIECEWISE crashes | **0** |
+
+The "0% cache hits" section below is **resolved**. Two independent
+things were required:
+
+1. **Five code fixes** (commits through `8546c2a71`). The last three —
+   cudagraph buffer clone, GPU-authoritative `num_computed_d`, and
+   `num_decodes` slice in `commit_boundary_states` — lived only in
+   the previous agent's offline-bundle wheel for a day before being
+   recovered and committed on 2026-04-11. See commit `8546c2a71`.
+2. **Server config change**: `--mamba-block-size 256` instead of the
+   original 512. With 512 the LCM-aligned block size inflated to
+   ~4608 tokens and the Eagle block drop wiped all cache hits even
+   with the coordinator-level fix. 256 keeps the LCM small enough
+   that multi-turn conversations actually hit.
+
+### Verified startup command (the one that works)
+
+```bash
+HF_HOME=/workspace/.hf_home VLLM_USE_FLASHINFER_MOE_FP8=1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+vllm serve chankhavu/Nemotron-Cascade-2-30B-A3B-FP8 \
+  --max-model-len 131072 --trust-remote-code \
+  --mamba-ssm-cache-dtype float16 --max-num-seqs 16 \
+  --kv-cache-dtype fp8 --enable-prefix-caching \
+  --mamba-cache-mode all --mamba-block-size 256 \
+  --gpu-memory-utilization 0.9 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --download-dir /workspace/models --host 127.0.0.1 --port 18000 \
+  --speculative-config '{"model":"chankhavu/c2.eagle3-test","method":"eagle3","num_speculative_tokens":4}'
+```
+
+No `--enforce-eager`; cudagraph mode is `FULL_AND_PIECEWISE`; async
+scheduling stays on by default.
+
+### Build-env gotcha
+
+On sm_120f (Blackwell RTX PRO 6000) with CUDA 13.0 / Python 3.12,
+FlashInfer's JIT compile of `gemm` fails because `/usr/local/cuda/include`
+is missing `cublasLt.h`. Install `flashinfer-jit-cache` to skip the
+JIT step entirely:
+
+```bash
+uv pip install flashinfer-jit-cache==0.6.7 \
+  --extra-index-url https://flashinfer.ai/whl/cu130/
+```
+
+---
+
+## Historical record: "v2 final status" as of 2026-04-10
+
+Everything below this line is the pre-fix snapshot. Kept for reference.
 
 ## What we built
 
