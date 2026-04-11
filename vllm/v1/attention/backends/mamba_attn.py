@@ -111,9 +111,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 self.vllm_config.model_config.max_model_len,
                 self.kv_cache_spec.block_size,
             )
-            # Speculative decoding not supported with prefix caching,
-            # so keep shape consistent with prefill buffer
-            # TODO: reduce this size as needed for decode-only cudagraph capture
+            # When spec decode is enabled, the per-request block table is
+            # allocated with `num_speculative_blocks` extra columns by the KV
+            # cache manager (see single_type_kv_cache_manager.py); the capture
+            # buffer must match that wider shape, otherwise the copy_ in
+            # _update_metadata_for_cudagraph_capture mismatches the metadata.
+            # This only triggers under FULL cudagraphs (e.g. FlashAttention on
+            # H100); FlashInfer falls back to PIECEWISE and skips it.
+            max_num_blocks += self.num_spec_tokens
             self.state_indices_tensor_d: torch.Tensor = torch.empty(
                 (
                     self.decode_cudagraph_max_bs,
