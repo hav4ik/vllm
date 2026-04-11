@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -95,15 +96,17 @@ TOOLS = [{
 # Answer type classification
 # ---------------------------------------------------------------------------
 
-def classify_answer_type(expected_answer: str) -> str:
+def classify_answer_type(expected_answer) -> str:
     """Classify the expected answer as 'nonneg_int', 'integer', or 'symbolic'.
+
+    Accepts str or numeric input; datasets may provide int answers directly.
 
     Returns:
         'nonneg_int' — non-negative integer in [0, 99999]
         'integer'    — any integer (including negative or > 99999)
         'symbolic'   — everything else (fractions, expressions, etc.)
     """
-    s = expected_answer.strip()
+    s = str(expected_answer).strip()
     # Check if it's an integer (possibly negative)
     try:
         val = int(s)
@@ -636,11 +639,160 @@ def _human(n: float) -> str:
     return f"{n:.0f}"
 
 
+# Keys to snapshot from vLLM /metrics for the run_summary.json baseline and final
+# points. We take deltas between start-of-run and end-of-run so the summary
+# reflects THIS run only, not the server's lifetime totals.
+_SUMMARY_METRIC_KEYS = (
+    "vllm:prompt_tokens_total",
+    "vllm:generation_tokens_total",
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+    "vllm:num_preemptions_total",
+)
+
+
+def _snapshot_metrics(metrics_urls: list[str]) -> dict:
+    """Fetch and aggregate the summary metrics across all servers."""
+    snap = {k: 0.0 for k in _SUMMARY_METRIC_KEYS}
+    snap["_fetched_at"] = time.time()
+    snap["_ok"] = False
+    for murl in metrics_urls:
+        m = _fetch_vllm_metrics(murl)
+        if not m:
+            continue
+        snap["_ok"] = True
+        for k in _SUMMARY_METRIC_KEYS:
+            snap[k] += _get_metric(m, k)
+    return snap
+
+
+def _aggregate_trace_timing(output_dir: Path) -> dict:
+    """Scan all per-problem JSONL files in output_dir and aggregate per-session
+    and per-problem timing statistics. Returns a dict suitable for dumping into
+    run_summary.json."""
+    session_times: list[float] = []
+    session_gen_tokens: list[int] = []
+    session_prompt_tokens: list[int] = []
+    problem_times: dict[str, float] = {}
+    problem_sessions: dict[str, int] = {}
+
+    for fp in sorted(output_dir.glob("*.jsonl")):
+        try:
+            with open(fp) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    pid = row.get("id", fp.stem)
+                    t = float(row.get("generation_time", 0.0))
+                    session_times.append(t)
+                    session_gen_tokens.append(int(row.get("num_completion_tokens", 0)))
+                    session_prompt_tokens.append(int(row.get("num_prompt_tokens", 0)))
+                    problem_times[pid] = problem_times.get(pid, 0.0) + t
+                    problem_sessions[pid] = problem_sessions.get(pid, 0) + 1
+        except Exception:
+            continue
+
+    def _avg(xs):
+        return sum(xs) / len(xs) if xs else 0.0
+
+    slowest = max(problem_times.items(), key=lambda kv: kv[1], default=(None, 0.0))
+    fastest = min(problem_times.items(), key=lambda kv: kv[1], default=(None, 0.0))
+
+    return {
+        "num_sessions": len(session_times),
+        "num_problems": len(problem_times),
+        "total_session_time_s": round(sum(session_times), 2),
+        "avg_session_time_s": round(_avg(session_times), 2),
+        "avg_problem_time_s": round(_avg(list(problem_times.values())), 2),
+        "slowest_problem": {"id": slowest[0], "total_time_s": round(slowest[1], 2)},
+        "fastest_problem": {"id": fastest[0], "total_time_s": round(fastest[1], 2)},
+        "total_gen_tokens": sum(session_gen_tokens),
+        "total_prompt_tokens": sum(session_prompt_tokens),
+        "avg_gen_tokens_per_session": round(_avg(session_gen_tokens), 1),
+        "avg_prompt_tokens_per_session": round(_avg(session_prompt_tokens), 1),
+    }
+
+
+def _write_run_summary_impl(*, output_dir: Path, args, server_addrs,
+                             metrics_urls, initial_metrics, run_start_time):
+    """Write {output_dir}/run_summary.json with the delta-vs-start metrics,
+    per-session timing aggregates, and the relevant args so two runs can be
+    diffed later."""
+    end_time = time.time()
+    elapsed = end_time - run_start_time
+    final_metrics = _snapshot_metrics(metrics_urls) if metrics_urls else None
+
+    def _delta(name):
+        if not (initial_metrics and final_metrics):
+            return None
+        return final_metrics[name] - initial_metrics[name]
+
+    d_prompt = _delta("vllm:prompt_tokens_total")
+    d_gen = _delta("vllm:generation_tokens_total")
+    d_cache_q = _delta("vllm:prefix_cache_queries_total")
+    d_cache_h = _delta("vllm:prefix_cache_hits_total")
+    d_spec_d = _delta("vllm:spec_decode_num_draft_tokens_total")
+    d_spec_a = _delta("vllm:spec_decode_num_accepted_tokens_total")
+    d_preempt = _delta("vllm:num_preemptions_total")
+
+    summary = {
+        "start_time": datetime.fromtimestamp(run_start_time).isoformat(timespec="seconds"),
+        "end_time": datetime.fromtimestamp(end_time).isoformat(timespec="seconds"),
+        "wallclock_s": round(elapsed, 2),
+        "wallclock_min": round(elapsed / 60, 2),
+        "server_addrs": server_addrs,
+        "config": {
+            "model_name": args.model_name,
+            "max_parallel": args.max_parallel,
+            "n_sessions": args.n_sessions,
+            "max_tokens": args.max_tokens,
+            "max_turns": args.max_turns,
+            "enable_thinking": args.enable_thinking,
+            "temperature": args.temperature,
+        },
+        "vllm_metrics_delta": {
+            "prompt_tokens_total": d_prompt,
+            "generation_tokens_total": d_gen,
+            "prefix_cache_queries_total": d_cache_q,
+            "prefix_cache_hits_total": d_cache_h,
+            "spec_draft_tokens_total": d_spec_d,
+            "spec_accepted_tokens_total": d_spec_a,
+            "num_preemptions_total": d_preempt,
+        },
+        "throughput": {
+            "gen_tokens_per_sec": round(d_gen / elapsed, 2) if (d_gen is not None and elapsed > 0) else None,
+            "prompt_tokens_per_sec": round(d_prompt / elapsed, 2) if (d_prompt is not None and elapsed > 0) else None,
+            "cache_hit_pct": (round(d_cache_h / d_cache_q * 100, 2)
+                              if (d_cache_q and d_cache_q > 0) else None),
+            "spec_accept_pct": (round(d_spec_a / d_spec_d * 100, 2)
+                                if (d_spec_d and d_spec_d > 0) else None),
+        },
+        "trace_timing": _aggregate_trace_timing(output_dir),
+        "progress": dict(_PROGRESS),
+    }
+
+    out_path = output_dir / "run_summary.json"
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    LOG.info(f"Run summary written to {out_path}")
+
+
 def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_port: int,
               metrics_urls: list[str] = None, interval: float = 30,
-              health_check_interval: float = 300):
-    """Background thread: progress + vLLM metrics table + periodic health checks."""
+              health_check_interval: float = 300,
+              output_dir: Path = None):
+    """Background thread: progress + vLLM metrics table + periodic health checks.
+
+    Tees rolling watchdog output to `{output_dir}/watchdog.log` (human-readable)
+    and `{output_dir}/watchdog.csv` (machine-readable) in addition to stdout,
+    so benchmark runs can be compared later without re-parsing the console.
+    """
     metrics_urls = metrics_urls or []
+    output_dir = output_dir or Path(".")
 
     HEADER = (
         f"{'Time':<9} "
@@ -660,10 +812,18 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
     )
     SEP = "─" * len(HEADER)
 
-    # CSV setup
-    csv_path = "vllm-watchdog-live.csv"
+    # Tee setup: rolling text output goes to stdout AND watchdog.log,
+    # machine-readable rows go to watchdog.csv — both under output_dir.
+    log_path = output_dir / "watchdog.log"
+    csv_path = output_dir / "watchdog.csv"
+    log_file = open(log_path, "a", buffering=1)
+    csv_file = open(csv_path, "a", buffering=1)
+
+    def _tee(msg: str):
+        print(msg, flush=True)
+        log_file.write(msg + "\n")
+
     CSV_HEADER = "timestamp,done,total,sb_errors,sb_calls,gen_tps,pfx_tps,reqs,running,waiting,cache_hit_pct,cached_tokens,spec_accept_pct,kv_usage_pct,kv_used_tokens,kv_total_tokens\n"
-    csv_file = open(csv_path, "a")
     if csv_file.tell() == 0:
         csv_file.write(CSV_HEADER)
         csv_file.flush()
@@ -781,9 +941,9 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
             dt = now - prev_time
             if dt > 0:
                 if row_count % 20 == 0:
-                    print(SEP, flush=True)
-                    print(HEADER, flush=True)
-                    print(SEP, flush=True)
+                    _tee(SEP)
+                    _tee(HEADER)
+                    _tee(SEP)
 
                 gen_tps    = (cur_gen - prev_gen) / dt
                 prompt_tps = (cur_prompt - prev_prompt) / dt
@@ -798,7 +958,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                 ts = datetime.now().strftime("%H:%M:%S")
                 kv_str = f"{_human(used_tok)}/{_human(total_tok)}" if total_tok else "?"
 
-                print(
+                _tee(
                     f"{ts:<9} "
                     f"{done_str:>12} "
                     f"{acc_str:>10} "
@@ -812,8 +972,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                     f"{_human(cur_cache_h):>9} "
                     f"{spec_pct:>5.1f}% "
                     f"{kv_pct:>5.1f}% "
-                    f"{kv_str:>16}",
-                    flush=True,
+                    f"{kv_str:>16}"
                 )
                 row_count += 1
 
@@ -825,7 +984,6 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
                     f"{running:.0f},{waiting:.0f},{cache_pct:.1f},"
                     f"{cur_cache_h:.0f},{spec_pct:.1f},{kv_pct:.2f},{used_tok},{total_tok}\n"
                 )
-                csv_file.flush()
 
         prev_prompt      = cur_prompt
         prev_gen         = cur_gen
@@ -837,6 +995,7 @@ def _watchdog(server_urls: list[str], api_key: str, sandbox_host: str, sandbox_p
         prev_time    = now
 
     csv_file.close()
+    log_file.close()
 
 
 def load_problems_from_dir(input_dir: str) -> list[dict]:
@@ -906,20 +1065,37 @@ def main():
                         help="Seconds to wait before re-scanning data dir for new files")
     parser.add_argument("--resume", action="store_true", help="Skip completed traces")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--log_file", default=None,
+                        help="Path to tee Python logger output to a file. "
+                             "Default: {output_dir}/run.log")
     args = parser.parse_args()
 
     if args.no_thinking:
         args.enable_thinking = False
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    # Resolve output_dir early so we can place log files inside it.
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = args.log_file or str(output_dir / "run.log")
+    log_handlers = [
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(log_file, mode="a"),
+    ]
+    for h in log_handlers:
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    # Clear any prior handlers (e.g. re-run in same process) so we don't double-log.
+    root.handlers.clear()
+    for h in log_handlers:
+        root.addHandler(h)
     # Silence sandbox client logs unless verbose — only show errors (failed executions)
     if not args.verbose:
         logging.getLogger("sandbox_client.py").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+    LOG.info(f"Logging to {log_file}")
 
     # Server addresses
     raw_addrs = args.server_addr or [os.environ.get("SERVER_ADDR", "")]
@@ -948,15 +1124,34 @@ def main():
         sys.exit(1)
     LOG.info("Health check passed")
 
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     # Derive metrics URLs from server addresses (strip /v1, add /metrics)
     if args.metrics_url is not None:
         metrics_urls = [args.metrics_url] if args.metrics_url else []
     else:
         metrics_urls = [re.sub(r'/v1$', '', addr) + "/metrics" for addr in server_addrs]
+
+    # Snapshot server metrics at run start so the run_summary can report
+    # THIS run's cumulative cache hits / spec accept / token counts via
+    # (final - initial), independent of earlier runs against the same server.
+    initial_metrics = _snapshot_metrics(metrics_urls) if metrics_urls else None
+    run_start_time = time.time()
+
+    def _write_run_summary():
+        """atexit: dump run_summary.json with cumulative deltas and per-trace
+        timing aggregates so two runs can be compared later."""
+        try:
+            _write_run_summary_impl(
+                output_dir=output_dir,
+                args=args,
+                server_addrs=server_addrs,
+                metrics_urls=metrics_urls,
+                initial_metrics=initial_metrics,
+                run_start_time=run_start_time,
+            )
+        except Exception as e:
+            LOG.error(f"Failed to write run_summary.json: {e}")
+
+    atexit.register(_write_run_summary)
 
     # Start background watchdog (metrics table + health checks)
     if args.health_check_interval > 0 or metrics_urls:
@@ -967,6 +1162,7 @@ def main():
                 "metrics_urls": metrics_urls,
                 "interval": args.watchdog_interval,
                 "health_check_interval": args.health_check_interval,
+                "output_dir": output_dir,
             },
             daemon=True,
         )
