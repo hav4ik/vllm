@@ -536,13 +536,6 @@ class SpecDecodeBaseProposer:
         # clone to isolate the target model's state.
         common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
 
-        # Also clone block_table_tensor — the drafter's Triton kernel
-        # reads it with seq_lens that increment K times. With PC's
-        # LCM-aligned block table, the incremented seq_lens can index
-        # past allocated blocks, causing OOB under cudagraph replay.
-        common_attn_metadata.block_table_tensor = (
-            common_attn_metadata.block_table_tensor.clone())
-
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
         # Only apply this adjustment when we have rejected tokens

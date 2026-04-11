@@ -508,14 +508,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_slot_ids: torch.Tensor | None = None
         if self._pc_spec_enabled:
             self._spec_max_seqs = vllm_config.scheduler_config.max_num_seqs
-            self._spec_K1 = 1 + self.num_spec
+            self._spec_slots_per_req = 1 + self.num_spec
             global _PC_SPEC_WARNED
             if not _PC_SPEC_WARNED:
                 _PC_SPEC_WARNED = True
                 logger.warning(
                     "PC + spec decode: using K+1=%d dedicated spec slots "
                     "per request (non-APC mode for both SSM and conv).",
-                    self._spec_K1,
+                    self._spec_slots_per_req,
                 )
 
         # Pre-compute sizes for forward pass
@@ -886,7 +886,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 conv_indices = spec_ids
                 conv_blk_last_sched = None  # IS_APC_ENABLED=False
                 conv_init_idx = None
-                conv_max_query_len = self._spec_K1
+                conv_max_query_len = self._spec_slots_per_req
 
                 # Clone before stashing: in cudagraph mode these are views
                 # of persistent metadata buffers that the next step's
@@ -992,8 +992,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
         is NULL_BLOCK_ID. Called once from gpu_model_runner after
         bind_kv_cache."""
         M = self._spec_max_seqs
-        K1 = self._spec_K1
-        total = M * K1 + 1
+        S = self._spec_slots_per_req
+        total = M * S + 1
         device = ssm_state.device
 
         def _strided(pool: torch.Tensor) -> torch.Tensor:
@@ -1009,8 +1009,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.spec_ssm = _strided(ssm_state)
         self.spec_conv = _strided(conv_state)
 
-        bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * K1
-        offsets = torch.arange(K1, device=device, dtype=torch.int32)
+        bases = 1 + torch.arange(M, device=device, dtype=torch.int32) * S
+        offsets = torch.arange(S, device=device, dtype=torch.int32)
         self._spec_slot_ids = (bases.unsqueeze(1) + offsets.unsqueeze(0)).contiguous()
         self._spec_base_long = bases.long().contiguous()
         self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
@@ -1032,17 +1032,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
         n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
         n_acc = num_accepted[:N]
 
+        # Commit when the next-to-be-generated token would land in a new
+        # block, i.e. when the accepted tokens either cross a boundary or
+        # sit exactly at one. Using blk_after = (n_done + n_acc) // block_size
+        # (rather than n_done + n_acc - 1) folds the at-boundary case into
+        # the crossed-past check: otherwise the boundary state would sit in
+        # the spec slot and be overwritten by the next step.
         blk_before = (n_done - 1).clamp(min=0) // block_size
-        blk_after = (n_done + n_acc - 1) // block_size
-
-        # Commit when accepted tokens cross OR land on a block boundary.
-        # The at_boundary case (last token at pos block_size - 1) also needs
-        # a commit: otherwise the boundary state sits in the spec slot and
-        # gets overwritten by the next step before reaching the pool.
-        crossed_past = (blk_before != blk_after)
-        last_accepted_pos = n_done + n_acc - 1
-        at_boundary = (last_accepted_pos % block_size == block_size - 1)
-        needs_commit = crossed_past | at_boundary
+        blk_after = (n_done + n_acc) // block_size
+        needs_commit = blk_after > blk_before
 
         if not needs_commit.any():
             self._spec_pending = None
@@ -1061,7 +1059,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self.kv_cache[1].index_copy_(
                 0, pool_slot[ix],
                 self.spec_ssm.index_select(0, src_slot[ix]))
-            from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
             pool_conv = self.kv_cache[0]
             spec_conv = self.spec_conv
             if not is_conv_state_dim_first():

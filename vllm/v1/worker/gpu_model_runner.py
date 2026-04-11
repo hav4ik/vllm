@@ -1387,12 +1387,12 @@ class GPUModelRunner(
                 for layer in self._pc_spec_layers:
                     if layer.spec_ssm is None:
                         continue
-                    K1 = layer._spec_K1
+                    S = layer._spec_slots_per_req
                     for old_pos, new_pos, _direction in new_moves:
-                        old_base = 1 + old_pos * K1
-                        new_base = 1 + new_pos * K1
-                        old_slots = slice(old_base, old_base + K1)
-                        new_slots = slice(new_base, new_base + K1)
+                        old_base = 1 + old_pos * S
+                        new_base = 1 + new_pos * S
+                        old_slots = slice(old_base, old_base + S)
+                        new_slots = slice(new_base, new_base + S)
                         layer.spec_ssm[new_slots] = (
                             layer.spec_ssm[old_slots].clone())
                         layer.spec_conv[new_slots] = (
@@ -6860,8 +6860,7 @@ class GPUModelRunner(
         self._pc_spec_layers: list[MambaMixer2] = [
             layer
             for layer in self.compilation_config.static_forward_context.values()
-            if isinstance(layer, MambaMixer2)
-            and getattr(layer, "_pc_spec_enabled", False)
+            if isinstance(layer, MambaMixer2) and layer._pc_spec_enabled
         ]
         for layer in self._pc_spec_layers:
             if layer.spec_ssm is None:
