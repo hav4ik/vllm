@@ -899,10 +899,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 conv_init_idx = None
                 conv_max_query_len = self._spec_K1
 
-                # Stash for boundary commit
+                # Stash for boundary commit.  Clone because in
+                # cudagraph mode these are views of persistent
+                # buffers that get overwritten by the next metadata
+                # build.  Also stash GPU-computed num_computed_d
+                # (seq_lens - query_lens for decode requests) so the
+                # commit doesn't need the CPU tensor (async race).
+                num_computed_d = (
+                    attn_metadata.seq_lens[:num_decodes]
+                    - (query_start_loc_d[1:] - query_start_loc_d[:-1])
+                    if query_start_loc_d is not None
+                    else attn_metadata.seq_lens[:num_decodes] - 1
+                )
                 self._spec_pending = (
-                    state_indices_tensor_d,
-                    block_idx_last_computed_token_d,
+                    state_indices_tensor_d.clone(),
+                    block_idx_last_computed_token_d.clone(),
+                    num_computed_d.clone(),
                 )
 
             elif is_mamba_cache_all:
@@ -1047,7 +1059,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             pool_cv.index_select(0, canonical_slots.long()))
 
     def commit_boundary_states(self, num_accepted: torch.Tensor,
-                                num_computed: torch.Tensor, block_size: int):
+                                block_size: int):
         """At block boundaries, copy spec slot states → pool block slots.
         Called from gpu_model_runner after rejection sampler."""
         if not self._pc_spec_enabled or self.spec_ssm is None:
@@ -1055,9 +1067,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if not hasattr(self, '_spec_pending') or self._spec_pending is None:
             return
 
-        state_indices_d, blk_idx_last_computed = self._spec_pending
-        N = num_accepted.shape[0]
-        n_done = num_computed[:N]
+        state_indices_d, blk_idx_last_computed, num_computed_d = (
+            self._spec_pending)
+        # _spec_pending was set for decode requests only
+        # (state_indices_d has num_decodes rows).  The caller passes
+        # num_accepted for ALL requests (decode first, then prefill).
+        # We must slice to num_decodes to match dimensions; prefill
+        # requests don't have spec slots.
+        N = state_indices_d.shape[0]  # = num_decodes
+        n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
         n_acc = num_accepted[:N]
 
         blk_before = (n_done - 1).clamp(min=0) // block_size

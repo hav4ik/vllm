@@ -1531,9 +1531,6 @@ class GPUModelRunner(
                 from vllm.model_executor.layers.mamba.mamba_mixer2 import (
                     MambaMixer2)
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
-                num_computed_gpu = (
-                    self.input_batch.num_computed_tokens_cpu_tensor[
-                        :num_reqs].to(self.device))
                 bs = self.cache_config.mamba_block_size
                 for layer in (
                     self.compilation_config.static_forward_context.values()
@@ -1541,7 +1538,7 @@ class GPUModelRunner(
                     if isinstance(layer, MambaMixer2) and getattr(
                         layer, "_pc_spec_enabled", False):
                         layer.commit_boundary_states(
-                            num_accepted_gpu, num_computed_gpu, bs)
+                            num_accepted_gpu, bs)
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
