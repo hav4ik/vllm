@@ -4156,36 +4156,19 @@ class GPUModelRunner(
             # never reassigns it, silently disabling all future commits.
             self._spec_commit_stash = None
             if self._pc_spec_layers:
+                # Reset _spec_inited for requests in prefill so their
+                # next FULL decode re-inits from the (correct) post-
+                # prefill pool state instead of stale spec slots.
+                if max_num_scheduled_tokens > self.uniform_decode_query_len:
+                    for req_idx in range(num_reqs):
+                        if num_scheduled_tokens_np[req_idx] > self.uniform_decode_query_len:
+                            for layer in self._pc_spec_layers:
+                                if layer._spec_inited is not None:
+                                    layer._spec_inited[req_idx] = False
+
                 for layer in self._pc_spec_layers:
                     layer.eager_init_spec_slots()
                 self._spec_commit_stash = self._build_spec_commit_stash()
-
-                # Under FULL cudagraph capture, the mamba kernel runs for
-                # ALL positions in the padded batch (grid size = bucket
-                # size B), including positions [num_decodes, B) that have
-                # no real decode request this step. The kernel writes
-                # garbage (from dummy hidden_states) to spec slots at
-                # those padding positions. If a request later returns to
-                # a padded position (e.g. after a tool-call prefill
-                # continuation), _spec_inited[i] might still be True
-                # from the request's prior decode phase, so
-                # eager_init_spec_slots skips it and the kernel reads
-                # the garbage. Fix: mark positions beyond num_decodes as
-                # uninitialized so eager_init always clears them on re-
-                # entry. Under PIECEWISE this is a no-op (mamba runs
-                # eagerly with exact num_decodes, no padding writes).
-                if self._spec_commit_stash is not None:
-                    from vllm.forward_context import get_forward_context
-                    fc = get_forward_context()
-                    m = fc.attn_metadata
-                    if m is not None and isinstance(m, dict):
-                        layer0 = self._pc_spec_layers[0]
-                        md = m.get(layer0.prefix)
-                        if md is not None and md.num_decodes >= 0:
-                            nd = md.num_decodes
-                            for layer in self._pc_spec_layers:
-                                if layer._spec_inited is not None:
-                                    layer._spec_inited[nd:] = False
 
             model_output = self._model_forward(
                 input_ids=input_ids,

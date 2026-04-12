@@ -1337,23 +1337,6 @@ class CompilationConfig:
                 cudagraph_mode = CUDAGraphMode.NONE
             logger.warning(msg)
 
-        # Hybrid mamba models with PC + spec decode: the captured forward
-        # bakes the spec-slot decode path for all padded positions, but
-        # at replay some positions may be in prefill (tool-call turns).
-        # The mamba kernels process these with decode semantics, corrupting
-        # spec-slot state. Force PIECEWISE so mamba runs eagerly.
-        if (
-            cudagraph_mode.has_full_cudagraphs()
-            and uniform_decode_query_len > 1
-            and mamba_cache_mode == "all"
-        ):
-            logger.warning(
-                "Downgrading cudagraph_mode to PIECEWISE: hybrid mamba "
-                "PC + spec decode requires eager mamba forward to handle "
-                "mixed decode/prefill batches correctly"
-            )
-            cudagraph_mode = CUDAGraphMode.PIECEWISE
-
         # double check that we can support full cudagraph if they are requested
         # even after automatic downgrades
         if (
