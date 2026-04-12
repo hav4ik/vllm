@@ -4101,6 +4101,16 @@ class GPUModelRunner(
             if self.sample_complete_event is not None:
                 self.sample_complete_event.synchronize()
 
+            # PC + spec: populate per-request mamba spec slots from the
+            # pool in eager mode, before the (potentially captured)
+            # model forward runs. This replaces the old in-forward init
+            # that gated on `if needs_init.any():`, which triggered a
+            # D2H sync that's illegal during cudagraph stream capture
+            # (fatal under FULL_AND_PIECEWISE on H100 + FlashAttn).
+            if self._pc_spec_layers:
+                for layer in self._pc_spec_layers:
+                    layer.eager_init_spec_slots()
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

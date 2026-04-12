@@ -658,20 +658,32 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         if is_mamba_cache_all:
             # If prefix caching is enabled, retrieve the relevant variables
-            # for prefill and decode
-            block_idx_last_computed_token_d, block_idx_last_computed_token_p = (
-                torch.split(
-                    attn_metadata.block_idx_last_computed_token,
-                    [num_decodes, num_prefills],
-                    dim=0,
-                )
+            # for prefill and decode.
+            #
+            # Under FULL cudagraph capture, the persistent
+            # `block_idx_last_*` buffers are exposed as
+            # `[:num_decode_tokens]`, which can be larger than
+            # `num_decodes + num_prefills` (the padded capture batch
+            # rounds `num_decode_tokens` up). `torch.split` enforces
+            # sum-equal-size and blows up in that case, so we slice
+            # instead — same semantics in eager mode where tensor size
+            # equals `num_decodes + num_prefills`, and robust under
+            # capture where it doesn't.
+            block_idx_last_computed_token_d = (
+                attn_metadata.block_idx_last_computed_token[:num_decodes]
             )
-            block_idx_last_scheduled_token_d, block_idx_last_scheduled_token_p = (
-                torch.split(
-                    attn_metadata.block_idx_last_scheduled_token,
-                    [num_decodes, num_prefills],
-                    dim=0,
-                )
+            block_idx_last_computed_token_p = (
+                attn_metadata.block_idx_last_computed_token[
+                    num_decodes : num_decodes + num_prefills
+                ]
+            )
+            block_idx_last_scheduled_token_d = (
+                attn_metadata.block_idx_last_scheduled_token[:num_decodes]
+            )
+            block_idx_last_scheduled_token_p = (
+                attn_metadata.block_idx_last_scheduled_token[
+                    num_decodes : num_decodes + num_prefills
+                ]
             )
             # Prefill-only variables:
             block_idx_first_scheduled_token_p = (
@@ -866,23 +878,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     self.spec_conv if is_conv_state_dim_first()
                     else self.spec_conv.transpose(-1, -2))
 
-                # One-time copy from pool into spec slots on first decode
-                # step of a request (detected via _spec_inited).
-                needs_init = ~self._spec_inited[:num_decodes]
-                if needs_init.any():
-                    init_idx = needs_init.nonzero(as_tuple=True)[0]
-                    canonical = state_indices_tensor_d.gather(
-                        1, block_idx_last_computed_token_d.unsqueeze(1)
-                    ).squeeze(1).long()
-                    init_bases = base_long[init_idx]
-                    init_canon = canonical[init_idx]
-                    self.spec_ssm.index_copy_(
-                        0, init_bases,
-                        ssm_state.index_select(0, init_canon))
-                    spec_conv_view.index_copy_(
-                        0, init_bases,
-                        conv_state.index_select(0, init_canon))
-                    self._spec_inited[init_idx] = True
+                # Spec slots are initialized eagerly by the runner via
+                # `eager_init_spec_slots()` before this forward is entered,
+                # so we can treat `_spec_inited[:num_decodes]` as True for
+                # all active decode rows. The init used to live here gated
+                # on `if needs_init.any():`, but that Python branch on a
+                # CUDA tensor triggers an implicit `.item()` D2H sync which
+                # is forbidden inside cudagraph capture (raises
+                # cudaErrorStreamCaptureUnsupported). FlashAttention on
+                # H100 supports FULL cudagraphs with spec decode, so
+                # `mamba_mixer2` ends up inside the captured region and
+                # the sync is fatal. Moving the init to the runner keeps
+                # the captured forward data-independent.
 
                 state_indices_tensor_d_input = spec_ids
                 state_indices_tensor_d_output = spec_ids
@@ -1021,6 +1028,98 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_slot_ids = (bases.unsqueeze(1) + offsets.unsqueeze(0)).contiguous()
         self._spec_base_long = bases.long().contiguous()
         self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
+
+    def eager_init_spec_slots(self) -> None:
+        """Copy pool→spec-slot state for any decode row whose spec slots
+        haven't been populated yet. Runs OUTSIDE cudagraph capture.
+
+        The runner must call this from `execute_model` *before* the
+        captured model forward, within `set_forward_context` so that
+        `get_forward_context().attn_metadata[self.prefix]` resolves to
+        this layer's mamba metadata. After this returns, the captured
+        forward can treat `_spec_inited[:num_decodes]` as always True
+        and skip the per-step init check — which is required because
+        the old `if needs_init.any():` path implicitly calls `.item()`
+        on a CUDA bool tensor, which is a D2H sync and therefore
+        forbidden during stream capture
+        (`cudaErrorStreamCaptureUnsupported`). FlashAttention on H100
+        captures the mamba forward inside the FULL cudagraph, which
+        turns that sync into a boot-time crash.
+
+        Safe no-op if:
+          - spec slots haven't been allocated (no PC+spec),
+          - attn_metadata isn't set (profile run),
+          - this step has no decodes,
+          - this step isn't a spec-decode step (`num_accepted_tokens`
+            is None, so the forward wouldn't use spec slots anyway),
+          - mamba cache mode isn't "all",
+          - or all active decode rows are already initialized.
+        """
+        if not self._pc_spec_enabled or self.spec_ssm is None:
+            return
+        if self._spec_inited is None:
+            return
+        assert self.cache_config is not None
+        if self.cache_config.mamba_cache_mode != "all":
+            return
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            return
+        assert isinstance(attn_metadata, dict)
+        attn_metadata = attn_metadata.get(self.prefix)
+        if attn_metadata is None:
+            return
+        if attn_metadata.num_accepted_tokens is None:
+            return
+
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+
+        needs_init = ~self._spec_inited[:num_decodes]
+        # .item() is fine here: this method is only called outside
+        # cudagraph capture.
+        if not bool(needs_init.any()):
+            return
+
+        # Match the kernel-side conv layout used by conv_ssm_forward.
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        ssm_state = self.kv_cache[1]
+        spec_conv_view = (
+            self.spec_conv if is_conv_state_dim_first()
+            else self.spec_conv.transpose(-1, -2)
+        )
+
+        # state_indices_tensor_d is already the decode-only slice (it
+        # was built by torch.split([num_decodes, num_prefills])).
+        # block_idx_last_computed_token is the full request tensor;
+        # first `num_decodes` entries are the decode rows.
+        state_indices_tensor_d = attn_metadata.state_indices_tensor_d
+        block_idx_last_computed_d = (
+            attn_metadata.block_idx_last_computed_token[:num_decodes]
+        )
+
+        init_idx = needs_init.nonzero(as_tuple=True)[0]
+        canonical = state_indices_tensor_d.gather(
+            1, block_idx_last_computed_d.unsqueeze(1)
+        ).squeeze(1).long()
+        init_bases = self._spec_base_long[:num_decodes][init_idx]
+        init_canon = canonical[init_idx]
+        self.spec_ssm.index_copy_(
+            0, init_bases,
+            ssm_state.index_select(0, init_canon),
+        )
+        spec_conv_view.index_copy_(
+            0, init_bases,
+            conv_state.index_select(0, init_canon),
+        )
+        self._spec_inited[init_idx] = True
 
     def commit_boundary_states(self, num_accepted: torch.Tensor,
                                 block_size: int):
