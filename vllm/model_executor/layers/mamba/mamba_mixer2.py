@@ -1130,7 +1130,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if not hasattr(self, '_spec_pending') or self._spec_pending is None:
             return
 
-        state_indices_d, blk_idx_last_computed, num_computed_d = (
+        state_indices_d, _blk_idx_last_computed_unused, num_computed_d = (
             self._spec_pending)
         # _spec_pending is populated for decodes only; num_accepted covers
         # [decodes, prefills] so slice to num_decodes = state_indices_d.shape[0].
@@ -1138,26 +1138,49 @@ class MambaMixer2(MambaBase, PluggableLayer):
         n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
         n_acc = num_accepted[:N]
 
-        # Commit when the next-to-be-generated token would land in a new
-        # block, i.e. when the accepted tokens either cross a boundary or
-        # sit exactly at one. Using blk_after = (n_done + n_acc) // block_size
-        # (rather than n_done + n_acc - 1) folds the at-boundary case into
-        # the crossed-past check: otherwise the boundary state would sit in
-        # the spec slot and be overwritten by the next step.
-        blk_before = (n_done - 1).clamp(min=0) // block_size
-        blk_after = (n_done + n_acc) // block_size
-        needs_commit = blk_after > blk_before
+        # Commit the boundary state of a mamba block back to the pool when
+        # *this step* actually writes a token at that block-end position.
+        #
+        # The previous formulation used
+        #   blk_before = (n_done - 1) // block_size
+        #   blk_after  = (n_done + n_acc) // block_size
+        #   needs_commit = blk_after > blk_before
+        # which fires a spurious commit whenever `n_done` lands exactly on
+        # a block boundary (e.g. n_done=256, n_acc=1, block_size=256):
+        # `blk_before=0`, `blk_after=1`, `needs_commit=True`, and then
+        # `cand_idx = boundary_pos - n_done = -1 → clamp 0`. Under that
+        # clamp, the source slot is `base + 0`, which the kernel has JUST
+        # written with the state of candidate 0 of *this* step — i.e. the
+        # state at position n_done, not the boundary position n_done - 1.
+        # The commit then overwrites the pool's correct block-0 slot
+        # (already committed in the prior step) with state from block 1.
+        # On later turns, prefix-cache hits read that corrupted slot as
+        # their SSM starting state, drift accumulates over thousands of
+        # decode steps, and the final answer comes out as garbage tokens.
+        #
+        # Correct semantic: we need to commit iff some position
+        #   p = (k+1) * block_size - 1
+        # lies in [n_done, n_done + n_acc). Under the practical constraint
+        # n_acc <= K+1 << block_size, at most one such boundary exists in
+        # the step's window, and it's the tail of the block containing
+        # n_done: `boundary_pos = (n_done // bs + 1) * bs - 1`. We also use
+        # n_done // bs (the block we're decoding into) as the pool slot
+        # index instead of the stashed blk_idx_last_computed (which was
+        # `(n_done - 1) // bs` and disagreed with the block we're writing
+        # the boundary of when n_done was a multiple of bs).
+        blk_current = n_done // block_size
+        boundary_pos = (blk_current + 1) * block_size - 1
+        needs_commit = boundary_pos < (n_done + n_acc)
 
         if not needs_commit.any():
             self._spec_pending = None
             return
 
-        boundary_pos = (blk_before + 1) * block_size - 1
         cand_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
         base = self._spec_base_long[:N]
         src_slot = base + cand_idx.long()
         pool_slot = state_indices_d.gather(
-            1, blk_idx_last_computed.unsqueeze(1)
+            1, blk_current.unsqueeze(1).to(torch.int64)
         ).squeeze(1).long()
 
         ix = needs_commit.nonzero(as_tuple=True)[0]
