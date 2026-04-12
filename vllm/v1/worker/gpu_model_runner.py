@@ -1459,6 +1459,24 @@ class GPUModelRunner(
         else:
             return None
 
+    def _get_mamba_spec_metadata(self):
+        """Get mamba attn_metadata for the spec layers, or None."""
+        from vllm.forward_context import get_forward_context
+        m = get_forward_context().attn_metadata
+        if m is None:
+            return None
+        assert isinstance(m, dict)
+        return m.get(self._pc_spec_layers[0].prefix)
+
+    def _build_spec_commit_stash(self, m):
+        """Clone commit metadata outside cudagraph capture."""
+        nd = m.num_decodes
+        state_indices_d = m.state_indices_tensor_d[:nd].clone()
+        qlen = (m.query_start_loc_d[1:] - m.query_start_loc_d[:-1]
+                if m.query_start_loc_d is not None else 1)
+        num_computed_d = (m.seq_lens[:nd] - qlen).clone()
+        return (state_indices_d, num_computed_d)
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1520,11 +1538,16 @@ class GPUModelRunner(
             self.num_accepted_tokens_event.record()
 
             # PC + spec: commit boundary states from spec slots → pool.
-            if self._pc_spec_layers:
+            if self._pc_spec_layers and self._spec_commit_stash is not None:
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
                 bs = self.cache_config.mamba_block_size
+                state_indices_d, num_computed_d = self._spec_commit_stash
                 for layer in self._pc_spec_layers:
-                    layer.commit_boundary_states(num_accepted_gpu, bs)
+                    layer.commit_boundary_states(
+                        num_accepted_gpu, bs,
+                        state_indices_d, num_computed_d,
+                    )
+                self._spec_commit_stash = None
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -4100,6 +4123,23 @@ class GPUModelRunner(
             # the model forward reads from the mamba state pool.
             if self.sample_complete_event is not None:
                 self.sample_complete_event.synchronize()
+
+            # PC + spec: eager init, commit stash, and padding reset
+            # must happen outside cudagraph capture (before _model_forward).
+            self._spec_commit_stash = None
+            if self._pc_spec_layers:
+                m = self._get_mamba_spec_metadata()
+                if m is not None and m.num_accepted_tokens is not None:
+                    nd = m.num_decodes
+                    for layer in self._pc_spec_layers:
+                        layer.eager_init_spec_slots(m)
+                        # Reset padded positions: under FULL capture the
+                        # kernel writes to all bucket positions including
+                        # padding, corrupting spec slots for cycling reqs.
+                        layer._spec_inited[nd:] = False
+                    if nd > 0:
+                        self._spec_commit_stash = (
+                            self._build_spec_commit_stash(m))
 
             model_output = self._model_forward(
                 input_ids=input_ids,

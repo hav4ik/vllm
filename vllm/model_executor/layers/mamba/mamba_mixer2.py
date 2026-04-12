@@ -14,7 +14,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -54,8 +53,6 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
-logger = init_logger(__name__)
-_PC_SPEC_WARNED = False
 
 # Added by the IBM Team, 2024
 
@@ -514,14 +511,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if self._pc_spec_enabled:
             self._spec_max_seqs = vllm_config.scheduler_config.max_num_seqs
             self._spec_slots_per_req = 1 + self.num_spec
-            global _PC_SPEC_WARNED
-            if not _PC_SPEC_WARNED:
-                _PC_SPEC_WARNED = True
-                logger.warning(
-                    "PC + spec decode: using K+1=%d dedicated spec slots "
-                    "per request (non-APC mode for both SSM and conv).",
-                    self._spec_slots_per_req,
-                )
 
         # Pre-compute sizes for forward pass
         self.tped_intermediate_size = self.intermediate_size // self.tp_size
@@ -657,21 +646,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
 
         if is_mamba_cache_all:
-            # If prefix caching is enabled, retrieve the relevant variables
-            # for prefill and decode
-            block_idx_last_computed_token_d, block_idx_last_computed_token_p = (
-                torch.split(
-                    attn_metadata.block_idx_last_computed_token,
-                    [num_decodes, num_prefills],
-                    dim=0,
-                )
+            # Slice instead of torch.split: under FULL cudagraph capture
+            # the persistent buffer can be wider than num_decodes+num_prefills.
+            block_idx_last_computed_token_d = (
+                attn_metadata.block_idx_last_computed_token[:num_decodes]
             )
-            block_idx_last_scheduled_token_d, block_idx_last_scheduled_token_p = (
-                torch.split(
-                    attn_metadata.block_idx_last_scheduled_token,
-                    [num_decodes, num_prefills],
-                    dim=0,
-                )
+            block_idx_last_computed_token_p = (
+                attn_metadata.block_idx_last_computed_token[
+                    num_decodes : num_decodes + num_prefills
+                ]
+            )
+            block_idx_last_scheduled_token_d = (
+                attn_metadata.block_idx_last_scheduled_token[:num_decodes]
+            )
+            block_idx_last_scheduled_token_p = (
+                attn_metadata.block_idx_last_scheduled_token[
+                    num_decodes : num_decodes + num_prefills
+                ]
             )
             # Prefill-only variables:
             block_idx_first_scheduled_token_p = (
@@ -866,23 +857,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     self.spec_conv if is_conv_state_dim_first()
                     else self.spec_conv.transpose(-1, -2))
 
-                # One-time copy from pool into spec slots on first decode
-                # step of a request (detected via _spec_inited).
-                needs_init = ~self._spec_inited[:num_decodes]
-                if needs_init.any():
-                    init_idx = needs_init.nonzero(as_tuple=True)[0]
-                    canonical = state_indices_tensor_d.gather(
-                        1, block_idx_last_computed_token_d.unsqueeze(1)
-                    ).squeeze(1).long()
-                    init_bases = base_long[init_idx]
-                    init_canon = canonical[init_idx]
-                    self.spec_ssm.index_copy_(
-                        0, init_bases,
-                        ssm_state.index_select(0, init_canon))
-                    spec_conv_view.index_copy_(
-                        0, init_bases,
-                        conv_state.index_select(0, init_canon))
-                    self._spec_inited[init_idx] = True
+                # Spec slot init + commit stash moved to the runner
+                # (eager_init_spec_slots / _build_spec_commit_stash) to
+                # avoid .item() syncs and Python side-effects that are
+                # invisible to cudagraph replay under FULL capture.
 
                 state_indices_tensor_d_input = spec_ids
                 state_indices_tensor_d_output = spec_ids
@@ -893,22 +871,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 conv_init_idx = None
                 conv_max_query_len = self._spec_slots_per_req
 
-                # Clone before stashing: in cudagraph mode these are views
-                # of persistent metadata buffers that the next step's
-                # _prepare_inputs will overwrite before commit reads them.
-                # num_computed_d is computed on-GPU to dodge the async
-                # CPU-side race on num_computed_tokens_cpu_tensor.
-                num_computed_d = (
-                    attn_metadata.seq_lens[:num_decodes]
-                    - (query_start_loc_d[1:] - query_start_loc_d[:-1])
-                    if query_start_loc_d is not None
-                    else attn_metadata.seq_lens[:num_decodes] - 1
-                )
-                self._spec_pending = (
-                    state_indices_tensor_d.clone(),
-                    block_idx_last_computed_token_d.clone(),
-                    num_computed_d.clone(),
-                )
+
 
             elif is_mamba_cache_all:
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
@@ -1022,43 +985,76 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_base_long = bases.long().contiguous()
         self._spec_inited = torch.zeros(M, dtype=torch.bool, device=device)
 
-    def commit_boundary_states(self, num_accepted: torch.Tensor,
-                                block_size: int):
-        """After the rejection sampler, copy spec slot state back to the pool
-        for any request whose accepted tokens crossed a mamba block boundary."""
+    def eager_init_spec_slots(self, attn_metadata) -> None:
+        """Copy pool state into spec slots for new decode rows.
+
+        Must run outside cudagraph capture (.item() sync forbidden
+        during capture). Called from the runner before _model_forward.
+        """
+        if attn_metadata is None or attn_metadata.num_accepted_tokens is None:
+            return
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+
+        needs_init = ~self._spec_inited[:num_decodes]
+        if not bool(needs_init.any()):
+            return
+
+        conv_state = (
+            self.kv_cache[0] if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2))
+        ssm_state = self.kv_cache[1]
+        spec_conv_view = (
+            self.spec_conv if is_conv_state_dim_first()
+            else self.spec_conv.transpose(-1, -2))
+
+        state_indices_d = attn_metadata.state_indices_tensor_d
+        blk_last = attn_metadata.block_idx_last_computed_token[:num_decodes]
+
+        init_idx = needs_init.nonzero(as_tuple=True)[0]
+        canonical = state_indices_d.gather(
+            1, blk_last.unsqueeze(1)).squeeze(1).long()
+        init_bases = self._spec_base_long[:num_decodes][init_idx]
+        init_canon = canonical[init_idx]
+        self.spec_ssm.index_copy_(
+            0, init_bases, ssm_state.index_select(0, init_canon))
+        spec_conv_view.index_copy_(
+            0, init_bases, conv_state.index_select(0, init_canon))
+        self._spec_inited[init_idx] = True
+
+    def commit_boundary_states(
+        self,
+        num_accepted: torch.Tensor,
+        block_size: int,
+        state_indices_d: torch.Tensor,
+        num_computed_d: torch.Tensor,
+    ):
+        """Copy spec slot boundary state back to pool for cache reuse."""
         if not self._pc_spec_enabled or self.spec_ssm is None:
             return
-        if not hasattr(self, '_spec_pending') or self._spec_pending is None:
-            return
 
-        state_indices_d, blk_idx_last_computed, num_computed_d = (
-            self._spec_pending)
-        # _spec_pending is populated for decodes only; num_accepted covers
-        # [decodes, prefills] so slice to num_decodes = state_indices_d.shape[0].
-        N = state_indices_d.shape[0]
-        n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
+        # The stash may cover more positions than num_accepted if a
+        # request finished between stash-time and commit-time.
+        N = min(state_indices_d.shape[0], num_accepted.shape[0])
+        n_done = num_computed_d[:N]
         n_acc = num_accepted[:N]
 
-        # Commit when the next-to-be-generated token would land in a new
-        # block, i.e. when the accepted tokens either cross a boundary or
-        # sit exactly at one. Using blk_after = (n_done + n_acc) // block_size
-        # (rather than n_done + n_acc - 1) folds the at-boundary case into
-        # the crossed-past check: otherwise the boundary state would sit in
-        # the spec slot and be overwritten by the next step.
-        blk_before = (n_done - 1).clamp(min=0) // block_size
-        blk_after = (n_done + n_acc) // block_size
-        needs_commit = blk_after > blk_before
+        # Commit iff boundary_pos = (blk+1)*bs-1 is in [n_done, n_done+n_acc).
+        # Old check `(n_done-1)//bs < (n_done+n_acc)//bs` spuriously fires
+        # when n_done is a multiple of block_size (writes wrong candidate).
+        blk_current = n_done // block_size
+        boundary_pos = (blk_current + 1) * block_size - 1
+        needs_commit = boundary_pos < (n_done + n_acc)
 
         if not needs_commit.any():
-            self._spec_pending = None
             return
 
-        boundary_pos = (blk_before + 1) * block_size - 1
         cand_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
         base = self._spec_base_long[:N]
         src_slot = base + cand_idx.long()
         pool_slot = state_indices_d.gather(
-            1, blk_idx_last_computed.unsqueeze(1)
+            1, blk_current.unsqueeze(1).to(torch.int64)
         ).squeeze(1).long()
 
         ix = needs_commit.nonzero(as_tuple=True)[0]
@@ -1074,8 +1070,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             pool_conv.index_copy_(
                 0, pool_slot[ix],
                 spec_conv.index_select(0, src_slot[ix]))
-
-        self._spec_pending = None
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
