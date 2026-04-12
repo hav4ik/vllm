@@ -1459,6 +1459,42 @@ class GPUModelRunner(
         else:
             return None
 
+    def _build_spec_commit_stash(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Clone the metadata that commit_boundary_states needs, in eager
+        mode, before the captured forward runs.
+
+        The forward used to stash this internally via
+        ``self._spec_pending = (t.clone(), ...)``, but that Python
+        attribute assignment is invisible to cudagraph replay: after the
+        first commit sets it to None, the replay never reassigns it. By
+        cloning here (outside capture) and passing to commit as explicit
+        args, we avoid any Python side-effects in the captured region.
+        """
+        from vllm.forward_context import get_forward_context
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            return None
+        assert isinstance(attn_metadata, dict)
+        layer0 = self._pc_spec_layers[0]
+        m = attn_metadata.get(layer0.prefix)
+        if m is None or m.num_accepted_tokens is None:
+            return None
+        num_decodes = m.num_decodes
+        if num_decodes <= 0:
+            return None
+
+        state_indices_d = m.state_indices_tensor_d[:num_decodes].clone()
+        query_start_loc_d = m.query_start_loc_d
+        if query_start_loc_d is not None:
+            qlen = query_start_loc_d[1:] - query_start_loc_d[:-1]
+        else:
+            qlen = 1
+        num_computed_d = (m.seq_lens[:num_decodes] - qlen).clone()
+        return (state_indices_d, num_computed_d)
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1520,11 +1556,16 @@ class GPUModelRunner(
             self.num_accepted_tokens_event.record()
 
             # PC + spec: commit boundary states from spec slots → pool.
-            if self._pc_spec_layers:
+            if self._pc_spec_layers and self._spec_commit_stash is not None:
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
                 bs = self.cache_config.mamba_block_size
+                state_indices_d, num_computed_d = self._spec_commit_stash
                 for layer in self._pc_spec_layers:
-                    layer.commit_boundary_states(num_accepted_gpu, bs)
+                    layer.commit_boundary_states(
+                        num_accepted_gpu, bs,
+                        state_indices_d, num_computed_d,
+                    )
+                self._spec_commit_stash = None
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -4107,9 +4148,44 @@ class GPUModelRunner(
             # that gated on `if needs_init.any():`, which triggered a
             # D2H sync that's illegal during cudagraph stream capture
             # (fatal under FULL_AND_PIECEWISE on H100 + FlashAttn).
+            #
+            # Also clone the metadata that commit_boundary_states needs.
+            # The forward used to stash this via self._spec_pending = (),
+            # but that's a Python side-effect invisible to cudagraph
+            # replay — after the first commit sets it to None, replay
+            # never reassigns it, silently disabling all future commits.
+            self._spec_commit_stash = None
             if self._pc_spec_layers:
                 for layer in self._pc_spec_layers:
                     layer.eager_init_spec_slots()
+                self._spec_commit_stash = self._build_spec_commit_stash()
+
+                # Under FULL cudagraph capture, the mamba kernel runs for
+                # ALL positions in the padded batch (grid size = bucket
+                # size B), including positions [num_decodes, B) that have
+                # no real decode request this step. The kernel writes
+                # garbage (from dummy hidden_states) to spec slots at
+                # those padding positions. If a request later returns to
+                # a padded position (e.g. after a tool-call prefill
+                # continuation), _spec_inited[i] might still be True
+                # from the request's prior decode phase, so
+                # eager_init_spec_slots skips it and the kernel reads
+                # the garbage. Fix: mark positions beyond num_decodes as
+                # uninitialized so eager_init always clears them on re-
+                # entry. Under PIECEWISE this is a no-op (mamba runs
+                # eagerly with exact num_decodes, no padding writes).
+                if self._spec_commit_stash is not None:
+                    from vllm.forward_context import get_forward_context
+                    fc = get_forward_context()
+                    m = fc.attn_metadata
+                    if m is not None and isinstance(m, dict):
+                        layer0 = self._pc_spec_layers[0]
+                        md = m.get(layer0.prefix)
+                        if md is not None and md.num_decodes >= 0:
+                            nd = md.num_decodes
+                            for layer in self._pc_spec_layers:
+                                if layer._spec_inited is not None:
+                                    layer._spec_inited[nd:] = False
 
             model_output = self._model_forward(
                 input_ids=input_ids,

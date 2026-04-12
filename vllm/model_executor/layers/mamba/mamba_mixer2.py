@@ -900,22 +900,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 conv_init_idx = None
                 conv_max_query_len = self._spec_slots_per_req
 
-                # Clone before stashing: in cudagraph mode these are views
-                # of persistent metadata buffers that the next step's
-                # _prepare_inputs will overwrite before commit reads them.
-                # num_computed_d is computed on-GPU to dodge the async
-                # CPU-side race on num_computed_tokens_cpu_tensor.
-                num_computed_d = (
-                    attn_metadata.seq_lens[:num_decodes]
-                    - (query_start_loc_d[1:] - query_start_loc_d[:-1])
-                    if query_start_loc_d is not None
-                    else attn_metadata.seq_lens[:num_decodes] - 1
-                )
-                self._spec_pending = (
-                    state_indices_tensor_d.clone(),
-                    block_idx_last_computed_token_d.clone(),
-                    num_computed_d.clone(),
-                )
+                # NOTE: the commit metadata (state_indices_tensor_d,
+                # num_computed_d) used to be stashed here via
+                #   self._spec_pending = (t1.clone(), t2.clone(), t3.clone())
+                # That's a Python attribute assignment — a side-effect
+                # invisible to cudagraph replay. Under FULL capture, the
+                # assignment runs once at capture time; after commit sets
+                # self._spec_pending = None, the replay never reassigns it,
+                # so commit_boundary_states sees None on every subsequent
+                # step and silently skips all boundary commits. Pool blocks
+                # never get updated; later cache-hit reads see stale state;
+                # output degrades into garbage.
+                #
+                # Fix: the runner now clones the metadata in eager mode
+                # (before _model_forward) and passes it to
+                # commit_boundary_states as explicit arguments. No Python
+                # side-effects inside the captured forward.
 
             elif is_mamba_cache_all:
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
@@ -1121,21 +1121,27 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self._spec_inited[init_idx] = True
 
-    def commit_boundary_states(self, num_accepted: torch.Tensor,
-                                block_size: int):
+    def commit_boundary_states(
+        self,
+        num_accepted: torch.Tensor,
+        block_size: int,
+        state_indices_d: torch.Tensor,
+        num_computed_d: torch.Tensor,
+    ):
         """After the rejection sampler, copy spec slot state back to the pool
-        for any request whose accepted tokens crossed a mamba block boundary."""
+        for any request whose accepted tokens crossed a mamba block boundary.
+
+        ``state_indices_d`` and ``num_computed_d`` are cloned by the runner
+        in eager mode (before the captured forward) and passed here so that
+        this method doesn't depend on Python side-effects inside the
+        captured graph (see the note in conv_ssm_forward)."""
         if not self._pc_spec_enabled or self.spec_ssm is None:
             return
-        if not hasattr(self, '_spec_pending') or self._spec_pending is None:
-            return
 
-        state_indices_d, _blk_idx_last_computed_unused, num_computed_d = (
-            self._spec_pending)
-        # _spec_pending is populated for decodes only; num_accepted covers
-        # [decodes, prefills] so slice to num_decodes = state_indices_d.shape[0].
-        N = state_indices_d.shape[0]
-        n_done = num_computed_d  # GPU-authoritative, already [num_decodes]
+        # The stash may cover more positions than num_accepted if a
+        # request finished between stash-time and commit-time.
+        N = min(state_indices_d.shape[0], num_accepted.shape[0])
+        n_done = num_computed_d[:N]
         n_acc = num_accepted[:N]
 
         # Commit the boundary state of a mamba block back to the pool when
@@ -1173,7 +1179,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
         needs_commit = boundary_pos < (n_done + n_acc)
 
         if not needs_commit.any():
-            self._spec_pending = None
             return
 
         cand_idx = (boundary_pos - n_done).clamp(min=0, max=self.num_spec)
@@ -1196,8 +1201,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             pool_conv.index_copy_(
                 0, pool_slot[ix],
                 spec_conv.index_select(0, src_slot[ix]))
-
-        self._spec_pending = None
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
