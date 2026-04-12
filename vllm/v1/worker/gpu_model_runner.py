@@ -4160,12 +4160,20 @@ class GPUModelRunner(
                     layer.eager_init_spec_slots()
                 self._spec_commit_stash = self._build_spec_commit_stash()
 
-                # Under FULL cudagraph capture, the kernel writes to ALL
-                # bucket positions including padding. Save spec slots
-                # for non-decode positions before the forward, restore
-                # after to undo padding writes. Only needed when
-                # num_decodes < max_num_seqs (some positions in prefill).
-                self._spec_slot_backup = None
+                # Under FULL cudagraph capture, the mamba kernel runs for
+                # ALL positions in the padded batch (grid size = bucket
+                # size B), including positions [num_decodes, B) that have
+                # no real decode request this step. The kernel writes
+                # garbage (from dummy hidden_states) to spec slots at
+                # those padding positions. If a request later returns to
+                # a padded position (e.g. after a tool-call prefill
+                # continuation), _spec_inited[i] might still be True
+                # from the request's prior decode phase, so
+                # eager_init_spec_slots skips it and the kernel reads
+                # the garbage. Fix: mark positions beyond num_decodes as
+                # uninitialized so eager_init always clears them on re-
+                # entry. Under PIECEWISE this is a no-op (mamba runs
+                # eagerly with exact num_decodes, no padding writes).
                 if self._spec_commit_stash is not None:
                     from vllm.forward_context import get_forward_context
                     fc = get_forward_context()
@@ -4173,19 +4181,11 @@ class GPUModelRunner(
                     if m is not None and isinstance(m, dict):
                         layer0 = self._pc_spec_layers[0]
                         md = m.get(layer0.prefix)
-                        if md is not None:
+                        if md is not None and md.num_decodes >= 0:
                             nd = md.num_decodes
-                            M = layer0._spec_max_seqs
-                            if nd < M:
-                                S = layer0._spec_slots_per_req
-                                # Slot range for positions [nd, M)
-                                lo = 1 + nd * S
-                                hi = 1 + M * S
-                                self._spec_slot_backup = [
-                                    (layer.spec_ssm[lo:hi].clone(),
-                                     layer.spec_conv[lo:hi].clone())
-                                    for layer in self._pc_spec_layers
-                                ]
+                            for layer in self._pc_spec_layers:
+                                if layer._spec_inited is not None:
+                                    layer._spec_inited[nd:] = False
 
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -4194,20 +4194,6 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-
-            # Restore spec slots corrupted by padding writes
-            if self._spec_slot_backup is not None:
-                nd = md.num_decodes
-                M = self._pc_spec_layers[0]._spec_max_seqs
-                S = self._pc_spec_layers[0]._spec_slots_per_req
-                lo = 1 + nd * S
-                hi = 1 + M * S
-                for layer, (ssm_bak, conv_bak) in zip(
-                    self._pc_spec_layers, self._spec_slot_backup
-                ):
-                    layer.spec_ssm[lo:hi] = ssm_bak
-                    layer.spec_conv[lo:hi] = conv_bak
-                self._spec_slot_backup = None
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -6510,6 +6496,7 @@ class GPUModelRunner(
             self.kv_cache_config,
             self.max_num_reqs,
             is_profiling=is_profiling,
+            mamba_cache_mode=self.cache_config.mamba_cache_mode,
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.

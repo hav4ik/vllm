@@ -367,6 +367,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.parallel_config.tensor_parallel_size,
             self.kv_cache_config,
             self.max_num_reqs,
+            mamba_cache_mode=self.cache_config.mamba_cache_mode,
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
