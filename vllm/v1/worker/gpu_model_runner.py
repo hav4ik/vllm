@@ -1116,6 +1116,19 @@ class GPUModelRunner(
                         if layer._spec_inited is not None:
                             layer._spec_inited[batch_idx] = False
 
+        # LAZY COMMIT: flush before removing finished requests
+        # (their pool blocks will be released to prefix cache).
+        if (scheduler_output.finished_req_ids
+                and hasattr(self, '_lazy_commit_data')
+                and self._lazy_commit_data):
+            ix = self._lazy_commit_needs.nonzero(as_tuple=True)[0]
+            if ix.numel() > 0:
+                cs = self._lazy_commit_src[ix]
+                cd = self._lazy_commit_dst[ix]
+                for layer in self._pc_spec_layers:
+                    layer.commit_boundary_fast(cs, cd)
+            self._lazy_commit_data = False
+
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
@@ -1580,12 +1593,48 @@ class GPUModelRunner(
             # Compute indices for ALL requests, then conditionally
             # write using the needs_commit mask.
             if self._pc_spec_layers and self._spec_commit_stash is not None:
-                # Stash for post-drafter commit (fire-and-forget GPU ops)
-                self._pending_commit = (
-                    self.num_accepted_tokens.gpu[:num_reqs],
-                    self._spec_commit_stash,
-                )
+                # LAZY COMMIT: compute commit indices on GPU (no sync)
+                # and accumulate. Only execute the actual index_copy_
+                # when pool will be read (transition/finish).
+                num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
+                state_indices_d, num_computed_d = self._spec_commit_stash
                 self._spec_commit_stash = None
+                bs = self.cache_config.mamba_block_size
+                N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
+                n_done = num_computed_d[:N]
+                n_acc = num_accepted_gpu[:N]
+                blk_current = n_done // bs
+                boundary_pos = (blk_current + 1) * bs - 1
+                needs_commit = boundary_pos < (n_done + n_acc)
+                # Accumulate: OR with any previous uncommitted flags
+                if not hasattr(self, '_lazy_commit_data'):
+                    self._lazy_commit_needs = needs_commit.clone()
+                    layer0 = self._pc_spec_layers[0]
+                    cand_idx = (boundary_pos - n_done).clamp(
+                        min=0, max=layer0.num_spec)
+                    base = layer0._spec_base_long[:N]
+                    self._lazy_commit_src = base + cand_idx.long()
+                    self._lazy_commit_dst = state_indices_d.gather(
+                        1, blk_current.unsqueeze(1).to(torch.int64)
+                    ).squeeze(1).long()
+                    self._lazy_commit_data = True
+                else:
+                    # Update: new boundary crossings overwrite old ones
+                    # (the latest boundary state is the correct one)
+                    layer0 = self._pc_spec_layers[0]
+                    cand_idx = (boundary_pos - n_done).clamp(
+                        min=0, max=layer0.num_spec)
+                    base = layer0._spec_base_long[:N]
+                    new_src = base + cand_idx.long()
+                    new_dst = state_indices_d.gather(
+                        1, blk_current.unsqueeze(1).to(torch.int64)
+                    ).squeeze(1).long()
+                    # For requests with new boundary crossing, update
+                    self._lazy_commit_src = torch.where(
+                        needs_commit, new_src, self._lazy_commit_src)
+                    self._lazy_commit_dst = torch.where(
+                        needs_commit, new_dst, self._lazy_commit_dst)
+                    self._lazy_commit_needs |= needs_commit
             if False:  # dead code from previous approach
                 layer0 = self._pc_spec_layers[0]
                 cand_idx = None
@@ -4311,6 +4360,16 @@ class GPUModelRunner(
                                 layer._spec_inited[req_idx] = False
                         self.num_accepted_tokens.gpu[req_idx] = 1
 
+                # LAZY COMMIT: flush pending commits before reading pool
+                if hasattr(self, '_lazy_commit_data') and self._lazy_commit_data:
+                    ix = self._lazy_commit_needs.nonzero(as_tuple=True)[0]
+                    if ix.numel() > 0:
+                        cs = self._lazy_commit_src[ix]
+                        cd = self._lazy_commit_dst[ix]
+                        for layer in self._pc_spec_layers:
+                            layer.commit_boundary_fast(cs, cd)
+                    self._lazy_commit_data = False
+
                 for layer in self._pc_spec_layers:
                     layer.eager_init_spec_slots()
                 self._spec_commit_stash = self._build_spec_commit_stash()
@@ -4618,34 +4677,9 @@ class GPUModelRunner(
         if spec_config is not None:
             self.finalize_kv_connector()
 
-        # PC + spec: execute commit AFTER drafter. All GPU ops
-        # (forward, sampling, drafter) are queued. The commit ops
-        # queue behind them on the same stream. CPU just launches
-        # and moves on — zero sync.
-        if hasattr(self, '_pending_commit') and self._pending_commit is not None:
-            num_accepted_gpu, (state_indices_d, num_computed_d) = (
-                self._pending_commit)
-            self._pending_commit = None
-            bs = self.cache_config.mamba_block_size
-            N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
-            n_done = num_computed_d[:N]
-            n_acc = num_accepted_gpu[:N]
-            blk_current = n_done // bs
-            boundary_pos = (blk_current + 1) * bs - 1
-            needs_commit = boundary_pos < (n_done + n_acc)
-            layer0 = self._pc_spec_layers[0]
-            cand_idx = (boundary_pos - n_done).clamp(
-                min=0, max=layer0.num_spec)
-            base = layer0._spec_base_long[:N]
-            src_slot = base + cand_idx.long()
-            pool_slot = state_indices_d.gather(
-                1, blk_current.unsqueeze(1).to(torch.int64)
-            ).squeeze(1).long()
-            safe_slot = state_indices_d[:N, 0].long().clamp(min=1)
-            pool_slot = torch.where(needs_commit, pool_slot, safe_slot)
-            for layer in self._pc_spec_layers:
-                layer.commit_boundary_masked(
-                    src_slot, pool_slot, needs_commit)
+        # LAZY COMMIT: no commit during decode steps. Pool is only
+        # read on transitions (eager_init_spec_slots) and request
+        # finish. Commit happens on-demand at those points.
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
