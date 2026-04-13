@@ -161,9 +161,102 @@ _copy_draft_token_ids_to_cpu D2H sync, engine scheduling.
 Metadata caching optimization confirmed: build_per_group dropped
 from ~2ms to 0.02ms, but zero impact on step time.
 
-## TODO
+## Why Eagle3 cannot win on fast MoE models
 
-- Profile _build_attention_metadata internals
-- Profile sample_tokens breakdown
-- Test K=1 and K=2
-- File upstream vLLM issue with profiling data
+The spec decode pipeline has ~9ms of **fixed per-step CPU overhead**
+that does not scale with model size:
+
+| Component              | Time (ms) | Scales with model? |
+|------------------------|-----------|-------------------|
+| Target forward (5 tok) | 4.2       | Yes               |
+| Drafter forward (4×)   | 2.9       | Yes (tiny model)  |
+| attn_meta build        | 2.4       | No — Python/CPU   |
+| prepare_inputs         | 1.7       | No — Python/CPU   |
+| commit_boundary (23L)  | 3.9       | No — kernel launches |
+| sample + bookkeep      | 1.1       | No — fixed         |
+| **Fixed overhead**     | **~9**    | **No**            |
+
+For a 70B dense model (~20ms forward), 9ms overhead = 45%. Spec
+decode can break even with ~60% acceptance.
+
+For NemotronH (3B active MoE, ~2ms forward), 9ms overhead = 4.5x
+the actual compute. **Spec decode can never win** because the
+scheduling tax exceeds the model compute.
+
+Our optimizations reduced total step from 18.0ms to 13.2ms (+42%),
+but the ~9ms CPU floor requires architectural changes to break.
+
+## Does this problem affect MTP and other speculators?
+
+**Yes, partially.** The overhead has two components:
+
+### 1. Per-step metadata overhead (~6ms) — affects ALL speculators
+
+- `_build_attention_metadata` for K+1 tokens: +4.9ms (mitigated to
+  +1.6ms with update_block_table, but still nonzero)
+- `_prepare_inputs` for K+1 tokens: +1.0ms
+- `commit_boundary_states` for hybrid mamba: +3.9ms (mamba-specific,
+  doesn't affect pure transformer models)
+
+Any speculator that processes K+1 tokens per target forward step
+pays this cost. MTP also processes multiple tokens per step, so it
+has the same `_build_attention_metadata` and `_prepare_inputs`
+overhead. The commit_boundary cost is specific to hybrid mamba
+models with prefix caching.
+
+### 2. Sequential drafter loop (~3ms) — Eagle3/MTP specific
+
+Eagle3 runs K=4 sequential drafter forward passes (each depends on
+the previous token). MTP similarly runs sequential draft heads.
+DFlash/Medusa use parallel drafting (one forward, multiple heads)
+which avoids this sequential cost.
+
+### Speculator comparison for fast MoE models:
+
+| Speculator    | Sequential drafts? | Metadata overhead? | Mamba commit? |
+|---------------|-------------------|-------------------|---------------|
+| Eagle3        | Yes (K passes)    | Yes (+4.9ms)      | Yes (+3.9ms)  |
+| MTP           | Yes (K passes)    | Yes (+4.9ms)      | Yes (+3.9ms)  |
+| DFlash/Medusa | No (1 pass)       | Yes (+4.9ms)      | Yes (+3.9ms)  |
+| Ngram         | No (CPU lookup)   | Yes (+4.9ms)      | Yes (+3.9ms)  |
+
+**DFlash/Medusa would eliminate the 3ms drafter loop** but still pay
+the metadata and commit overhead. For NemotronH, that reduces the
+overhead from ~9ms to ~6ms — still 3x the model forward.
+
+### When does spec decode help?
+
+Spec decode breaks even when:
+  mean_acceptance × (1 - overhead_fraction) > 1
+
+For NemotronH: overhead = 9ms, forward = 4.2ms, step = 13.2ms
+  overhead_fraction = 9/13.2 = 68%
+  need: mean_acceptance > 1/(1-0.68) = 3.13
+
+Current mean_acceptance = 3.11 — exactly at breakeven. This is why
+Eagle3 is marginally slower (214 tok/s) than no-Eagle (294 tok/s)
+instead of dramatically slower.
+
+For a 70B dense model: overhead = 9ms, forward = 20ms, step = 29ms
+  overhead_fraction = 9/29 = 31%
+  need: mean_acceptance > 1/(1-0.31) = 1.45
+
+Much easier to achieve. Eagle3 would give ~2x speedup there.
+
+## Optimization roadmap (upstream vLLM)
+
+### Quick wins (implemented in this branch)
+- [x] Re-enable update_block_table for mamba spec decode (-3ms)
+- [x] Batch commit_boundary_states indices (-1.5ms)
+- [x] Hoist pool_slot/src_slot computation (-0.3ms)
+- [x] Merge replace() calls in update_block_table (-0.1ms)
+
+### Medium effort
+- [ ] Batched Triton kernel for 23-layer commit (-2ms estimated)
+- [ ] Pre-create ForwardContext for drafter loop (-0.1ms)
+- [ ] Cache attn_meta across steps for decode-only batches (-2ms)
+
+### High effort (architectural)
+- [ ] Fuse drafter loop into single CUDA graph capture (-2ms)
+- [ ] Overlap CPU metadata build with GPU forward via pipelining
+- [ ] Move metadata construction to GPU (Triton kernels)
