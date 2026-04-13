@@ -3974,6 +3974,37 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            # PC + spec: execute deferred commit BEFORE _update_states
+            # modifies the batch (condense/remove). The stashed indices
+            # reference the previous step's batch layout.
+            if hasattr(self, '_deferred_commit') and self._deferred_commit is not None:
+                if self.sample_complete_event is not None:
+                    self.sample_complete_event.synchronize()
+                num_accepted_gpu, (state_indices_d, num_computed_d) = self._deferred_commit
+                self._deferred_commit = None
+                bs = self.cache_config.mamba_block_size
+                N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
+                n_done = num_computed_d[:N]
+                n_acc = num_accepted_gpu[:N]
+                blk_current = n_done // bs
+                boundary_pos = (blk_current + 1) * bs - 1
+                needs_commit = boundary_pos < (n_done + n_acc)
+                ix = needs_commit.nonzero(as_tuple=True)[0]
+                if ix.numel() > 0:
+                    layer0 = self._pc_spec_layers[0]
+                    cand_idx = (boundary_pos[ix] - n_done[ix]).clamp(
+                        min=0, max=layer0.num_spec)
+                    base = layer0._spec_base_long[:N]
+                    src_slot = base[ix] + cand_idx.long()
+                    pool_slot = state_indices_d.gather(
+                        1, blk_current[ix].unsqueeze(1).to(torch.int64)
+                    ).squeeze(1).long()
+                    from vllm.model_executor.layers.mamba.batch_commit_kernel import (
+                        batch_commit_states,
+                    )
+                    batch_commit_states(
+                        self._pc_spec_layers, src_slot, pool_slot)
+
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
             _em_t_update = _ptime.perf_counter()
@@ -4201,35 +4232,6 @@ class GPUModelRunner(
             # from the mamba state pool.
             if self.sample_complete_event is not None:
                 self.sample_complete_event.synchronize()
-
-            # PC + spec: execute deferred commit from previous step.
-            # This runs AFTER the sync, so the GPU data is ready and
-            # the .nonzero() won't stall the CPU pipeline.
-            if hasattr(self, '_deferred_commit') and self._deferred_commit is not None:
-                num_accepted_gpu, (state_indices_d, num_computed_d) = self._deferred_commit
-                self._deferred_commit = None
-                bs = self.cache_config.mamba_block_size
-                N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
-                n_done = num_computed_d[:N]
-                n_acc = num_accepted_gpu[:N]
-                blk_current = n_done // bs
-                boundary_pos = (blk_current + 1) * bs - 1
-                needs_commit = boundary_pos < (n_done + n_acc)
-                ix = needs_commit.nonzero(as_tuple=True)[0]
-                if ix.numel() > 0:
-                    layer0 = self._pc_spec_layers[0]
-                    cand_idx = (boundary_pos[ix] - n_done[ix]).clamp(
-                        min=0, max=layer0.num_spec)
-                    base = layer0._spec_base_long[:N]
-                    src_slot = base[ix] + cand_idx.long()
-                    pool_slot = state_indices_d.gather(
-                        1, blk_current[ix].unsqueeze(1).to(torch.int64)
-                    ).squeeze(1).long()
-                    from vllm.model_executor.layers.mamba.batch_commit_kernel import (
-                        batch_commit_states,
-                    )
-                    batch_commit_states(
-                        self._pc_spec_layers, src_slot, pool_slot)
 
             # PC + spec: populate per-request mamba spec slots from the
             # pool in eager mode, before the (potentially captured)
