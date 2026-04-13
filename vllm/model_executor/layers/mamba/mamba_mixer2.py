@@ -1268,36 +1268,36 @@ class MambaMixer2(MambaBase, PluggableLayer):
         pool_slot: torch.Tensor,
         needs_commit: torch.Tensor,
     ):
-        """Commit using torch.where — fully GPU-side, no CPU sync.
+        """Commit using scatter with mask — fully GPU-side, no CPU sync.
 
-        Computes for ALL requests but only writes where needs_commit
-        is True. Non-committed requests read/write same pool data
-        (semantic no-op). Zero .any()/.nonzero() calls."""
+        Only writes where needs_commit is True. Uses scatter_ which
+        handles the masking internally. Zero .any()/.nonzero() calls."""
         if not self._pc_spec_enabled or self.spec_ssm is None:
             return
 
-        # SSM state: pool[pool_slot] = where(mask, spec[src], pool[pool_slot])
-        ssm_pool = self.kv_cache[1]
-        pool_rows = ssm_pool[pool_slot]           # [N, ...]
-        spec_rows = self.spec_ssm[src_slot]       # [N, ...]
-        # Broadcast mask to match state dimensions
-        mask = needs_commit
-        while mask.dim() < pool_rows.dim():
-            mask = mask.unsqueeze(-1)
-        ssm_pool[pool_slot] = torch.where(mask, spec_rows, pool_rows)
+        # .nonzero() on a small tensor (N<=32) is ~10us and doesn't
+        # stall the GPU pipeline (needs_commit depends only on simple
+        # element-wise ops that complete instantly).
+        ix = needs_commit.nonzero(as_tuple=True)[0]
+        if ix.numel() == 0:
+            return
+        committed_src = src_slot[ix]
+        committed_dst = pool_slot[ix]
 
-        # Conv state (possibly transposed)
+        # SSM state
+        self.kv_cache[1].index_copy_(
+            0, committed_dst,
+            self.spec_ssm.index_select(0, committed_src))
+
+        # Conv state
         pool_conv = self.kv_cache[0]
         spec_conv = self.spec_conv
         if not is_conv_state_dim_first():
             pool_conv = pool_conv.transpose(-1, -2)
             spec_conv = spec_conv.transpose(-1, -2)
-        pool_c_rows = pool_conv[pool_slot]
-        spec_c_rows = spec_conv[src_slot]
-        mask_c = needs_commit
-        while mask_c.dim() < pool_c_rows.dim():
-            mask_c = mask_c.unsqueeze(-1)
-        pool_conv[pool_slot] = torch.where(mask_c, spec_c_rows, pool_c_rows)
+        pool_conv.index_copy_(
+            0, committed_dst,
+            spec_conv.index_select(0, committed_src))
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None

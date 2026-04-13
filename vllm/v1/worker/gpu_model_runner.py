@@ -1591,9 +1591,11 @@ class GPUModelRunner(
                 boundary_pos = (blk_current + 1) * bs - 1
                 needs_commit = boundary_pos < (n_done + n_acc)
 
-                # Compute src_slot/pool_slot for ALL requests (not
-                # just committed). Non-committed requests get valid
-                # but irrelevant indices — their writes are masked.
+                # Compute src_slot/pool_slot for ALL requests.
+                # Non-committed requests get needs_commit=False so
+                # torch.where writes back the existing pool value.
+                # Clamp pool_slot to min=1 to avoid reading/writing
+                # NULL block 0 (which is shared padding state).
                 layer0 = self._pc_spec_layers[0]
                 cand_idx = (boundary_pos - n_done).clamp(
                     min=0, max=layer0.num_spec)
@@ -1603,9 +1605,16 @@ class GPUModelRunner(
                     1, blk_current.unsqueeze(1).to(torch.int64)
                 ).squeeze(1).long()
 
-                for layer in self._pc_spec_layers:
-                    layer.commit_boundary_masked(
-                        src_slot, pool_slot, needs_commit)
+                # .nonzero() once for all layers (~10us, no pipeline
+                # stall since needs_commit depends on already-computed
+                # element-wise ops, not on the target forward).
+                ix = needs_commit.nonzero(as_tuple=True)[0]
+                if ix.numel() > 0:
+                    committed_src = src_slot[ix]
+                    committed_dst = pool_slot[ix]
+                    for layer in self._pc_spec_layers:
+                        layer.commit_boundary_fast(
+                            committed_src, committed_dst)
             _ut2 = _ut.perf_counter()
             if not hasattr(self, '_ut_sums'):
                 self._ut_sums = {"accepted": 0, "commit": 0}
