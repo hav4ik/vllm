@@ -245,6 +245,18 @@ Much easier to achieve. Eagle3 would give ~2x speedup there.
 
 ## Optimization roadmap (upstream vLLM)
 
+## 3-way throughput comparison (p=1, H100, no tools)
+
+| Config                   | Per-req tok/s | vs No-Eagle |
+|--------------------------|---------------|-------------|
+| Eagle3 no-PC             | 349           | +15%        |
+| Eagle3 + PC (optimized)  | 319           | +6%         |
+| No-Eagle no-PC           | 302           | baseline    |
+
+Eagle3 spec decode WORKS when overhead is minimized. PC integration
+adds ~30 tok/s tax from spec-slot infrastructure (init checks, stash
+cloning, deferred commit) running every step even when PC isn't used.
+
 ### Quick wins (implemented in this branch)
 - [x] Re-enable update_block_table for mamba spec decode (-3ms)
 - [x] Batch commit_boundary_states indices (-1.5ms)
