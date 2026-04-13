@@ -1268,26 +1268,25 @@ class MambaMixer2(MambaBase, PluggableLayer):
         pool_slot: torch.Tensor,
         needs_commit: torch.Tensor,
     ):
-        """Commit using scatter with mask — fully GPU-side, no CPU sync.
+        """Commit using torch.where — fully GPU-side, no CPU sync.
 
-        Only writes where needs_commit is True. Uses scatter_ which
-        handles the masking internally. Zero .any()/.nonzero() calls."""
+        For committed requests: writes spec slot state to pool.
+        For non-committed: reads pool and writes it back (no-op).
+        pool_slot must be clamped to min=1 by caller to avoid NULL."""
         if not self._pc_spec_enabled or self.spec_ssm is None:
             return
 
-        # .nonzero() on a small tensor (N<=32) is ~10us and doesn't
-        # stall the GPU pipeline (needs_commit depends only on simple
-        # element-wise ops that complete instantly).
-        ix = needs_commit.nonzero(as_tuple=True)[0]
-        if ix.numel() == 0:
-            return
-        committed_src = src_slot[ix]
-        committed_dst = pool_slot[ix]
+        mask = needs_commit
+        while mask.dim() < self.spec_ssm.dim():
+            mask = mask.unsqueeze(-1)
 
         # SSM state
-        self.kv_cache[1].index_copy_(
-            0, committed_dst,
-            self.spec_ssm.index_select(0, committed_src))
+        ssm_pool = self.kv_cache[1]
+        ssm_pool[pool_slot] = torch.where(
+            mask,
+            self.spec_ssm[src_slot],
+            ssm_pool[pool_slot],
+        )
 
         # Conv state
         pool_conv = self.kv_cache[0]
@@ -1295,9 +1294,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         if not is_conv_state_dim_first():
             pool_conv = pool_conv.transpose(-1, -2)
             spec_conv = spec_conv.transpose(-1, -2)
-        pool_conv.index_copy_(
-            0, committed_dst,
-            spec_conv.index_select(0, committed_src))
+        pool_conv[pool_slot] = torch.where(
+            mask,
+            spec_conv[src_slot],
+            pool_conv[pool_slot],
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None

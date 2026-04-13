@@ -1604,17 +1604,19 @@ class GPUModelRunner(
                 pool_slot = state_indices_d.gather(
                     1, blk_current.unsqueeze(1).to(torch.int64)
                 ).squeeze(1).long()
+                # For non-committed requests, redirect to their OWN
+                # first block (always valid & unique) so torch.where
+                # reads/writes their own block — no cross-request
+                # conflicts. Committed requests use the real pool_slot.
+                safe_slot = state_indices_d[:N, 0].long().clamp(min=1)
+                pool_slot = torch.where(needs_commit, pool_slot, safe_slot)
 
-                # .nonzero() once for all layers (~10us, no pipeline
-                # stall since needs_commit depends on already-computed
-                # element-wise ops, not on the target forward).
-                ix = needs_commit.nonzero(as_tuple=True)[0]
-                if ix.numel() > 0:
-                    committed_src = src_slot[ix]
-                    committed_dst = pool_slot[ix]
-                    for layer in self._pc_spec_layers:
-                        layer.commit_boundary_fast(
-                            committed_src, committed_dst)
+                # torch.where commit: fully GPU-side, zero CPU sync.
+                # Non-committed requests: write pool data back to
+                # itself (semantic no-op). ~0.2ms GPU bandwidth cost.
+                for layer in self._pc_spec_layers:
+                    layer.commit_boundary_masked(
+                        src_slot, pool_slot, needs_commit)
             _ut2 = _ut.perf_counter()
             if not hasattr(self, '_ut_sums'):
                 self._ut_sums = {"accepted": 0, "commit": 0}
