@@ -15,7 +15,12 @@ from vllm.config import (
     replace,
 )
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    create_forward_context,
+    override_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -556,9 +561,46 @@ class SpecDecodeBaseProposer:
         # (seq_lens, slot_mapping) are updated in-place by the CUDA kernel.
         _cached_group_metadata = None
         import time as _t
-        _prof_times = {"update": 0, "metadata": 0, "copy": 0, "ctx": 0, "fwd": 0, "sample": 0}
+        _prof_times = {"update": 0, "metadata": 0, "copy": 0, "ctx_fwd": 0, "sample": 0}
 
-        for token_index in range(self.num_speculative_tokens - 1):
+        # Pre-allocate model_kwargs dict once; update in-place each iteration
+        # to avoid dict creation overhead (~5us per iteration).
+        _model_kwargs = {
+            "input_ids": None,
+            "positions": None,
+            "inputs_embeds": None,
+        }
+        if self.pass_hidden_states_to_model:
+            _model_kwargs["hidden_states"] = None
+
+        # Create the forward context once before the loop and mutate its
+        # attn_metadata and slot_mapping fields per iteration, avoiding
+        # the overhead of set_forward_context's context manager machinery
+        # (DPMetadata creation, ForwardContext allocation, kernel_config
+        # priority context entry) on every iteration.
+        _drafter_fwd_ctx = create_forward_context(
+            attn_metadata=None,  # set on first iteration
+            vllm_config=self.vllm_config,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=BatchDescriptor(num_tokens=input_batch_size),
+            slot_mapping=self._get_slot_mapping(input_batch_size),
+        )
+        if (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.vllm_config.parallel_config.is_moe_model is not False
+        ):
+            from vllm.forward_context import DPMetadata
+            _drafter_fwd_ctx.dp_metadata = DPMetadata.make(
+                self.vllm_config.parallel_config,
+                input_batch_size,
+                batch_size_across_dp,
+            )
+
+        import vllm.forward_context as _fwd_ctx_module
+        _prev_fwd_ctx = _fwd_ctx_module._forward_context
+        _fwd_ctx_module._forward_context = _drafter_fwd_ctx
+        try:
+          for token_index in range(self.num_speculative_tokens - 1):
             _t0 = _t.perf_counter()
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
@@ -631,6 +673,12 @@ class SpecDecodeBaseProposer:
                 for md in _cached_group_metadata:
                     md.max_seq_len = common_attn_metadata.max_seq_len
 
+            # Mutate the forward context in-place instead of re-creating
+            _drafter_fwd_ctx.attn_metadata = per_layer_attn_metadata
+            _drafter_fwd_ctx.slot_mapping = self._get_slot_mapping(
+                input_batch_size
+            )
+
             _t2 = _t.perf_counter()
             _prof_times["metadata"] += _t2 - _t1
 
@@ -639,38 +687,25 @@ class SpecDecodeBaseProposer:
             self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
-                input_ids = None
-                inputs_embeds = self.inputs_embeds[:input_batch_size]
+                _model_kwargs["input_ids"] = None
+                _model_kwargs["inputs_embeds"] = self.inputs_embeds[:input_batch_size]
             else:
-                input_ids = self.input_ids[:input_batch_size]
-                inputs_embeds = None
+                _model_kwargs["input_ids"] = self.input_ids[:input_batch_size]
+                _model_kwargs["inputs_embeds"] = None
+            _model_kwargs["positions"] = self._get_positions(input_batch_size)
+            if self.pass_hidden_states_to_model:
+                _model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
             _t3 = _t.perf_counter()
-            _prof_times["copy"] += _t3 - _t2
+            _prof_times["copy"] = _prof_times.get("copy", 0) + _t3 - _t2
 
-            # Run the model.
-            model_kwargs = {
-                "input_ids": input_ids,
-                "positions": self._get_positions(input_batch_size),
-                "inputs_embeds": inputs_embeds,
-            }
-            if self.pass_hidden_states_to_model:
-                model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
-
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch_size,
-                num_tokens_across_dp=batch_size_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(input_batch_size),
-            ):
-                ret_hidden_states = self.model(**model_kwargs)
-                if not self.model_returns_tuple():
-                    last_hidden_states = ret_hidden_states
-                    hidden_states = ret_hidden_states
-                else:
-                    last_hidden_states, hidden_states = ret_hidden_states
+            # Run the model directly -- forward context already set above.
+            ret_hidden_states = self.model(**_model_kwargs)
+            if not self.model_returns_tuple():
+                last_hidden_states = ret_hidden_states
+                hidden_states = ret_hidden_states
+            else:
+                last_hidden_states, hidden_states = ret_hidden_states
 
             _t4 = _t.perf_counter()
             _prof_times["ctx_fwd"] = _prof_times.get("ctx_fwd", 0) + _t4 - _t3
@@ -680,6 +715,8 @@ class SpecDecodeBaseProposer:
             draft_token_ids_list.append(draft_token_ids)
             _t5 = _t.perf_counter()
             _prof_times["sample"] += _t5 - _t4
+        finally:
+          _fwd_ctx_module._forward_context = _prev_fwd_ctx
 
         # Log drafter loop profiling every 50 calls
         if not hasattr(self, '_prof_call_count'):
