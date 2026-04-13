@@ -4247,18 +4247,26 @@ class GPUModelRunner(
             # never reassigns it, silently disabling all future commits.
             self._spec_commit_stash = None
             if self._pc_spec_layers:
-                # Reset _spec_inited for requests in prefill so their
-                # next FULL decode re-inits from the (correct) post-
-                # prefill pool state instead of stale spec slots.
-                # Also reset num_accepted_tokens to 1 so the kernel
-                # reads from slot 0 (the freshly initialized base).
-                if max_num_scheduled_tokens > self.uniform_decode_query_len:
-                    for req_idx in range(num_reqs):
-                        if num_scheduled_tokens_np[req_idx] > self.uniform_decode_query_len:
-                            for layer in self._pc_spec_layers:
-                                if layer._spec_inited is not None:
-                                    layer._spec_inited[req_idx] = False
-                            self.num_accepted_tokens.gpu[req_idx] = 1
+                # Reset _spec_inited for requests that mamba will
+                # classify as prefill. Mamba uses is_prefilling
+                # (num_computed < num_prompt) with
+                # treat_short_extends_as_decodes=False, so a request
+                # can be prefill even with few scheduled tokens (short
+                # extends from tool-call responses). We must match
+                # mamba's criterion exactly, otherwise the reset is
+                # missed and the next decode uses stale spec slots.
+                num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                num_prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+                for req_idx in range(num_reqs):
+                    is_prefill_req = (
+                        num_scheduled_tokens_np[req_idx] > self.uniform_decode_query_len
+                        or num_computed[req_idx] < num_prompt[req_idx]
+                    )
+                    if is_prefill_req:
+                        for layer in self._pc_spec_layers:
+                            if layer._spec_inited is not None:
+                                layer._spec_inited[req_idx] = False
+                        self.num_accepted_tokens.gpu[req_idx] = 1
 
                 for layer in self._pc_spec_layers:
                     layer.eager_init_spec_slots()
