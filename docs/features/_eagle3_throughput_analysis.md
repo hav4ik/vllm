@@ -75,9 +75,66 @@ Eagle3 might help with:
 - Different drafter with higher acceptance rate
 - K=1 or K=2 (lower overhead, higher per-position acceptance)
 
+## Profiling results (H100, p=1, wall-clock + CUDA events)
+
+### No-Eagle baseline
+- **3.4ms/step** (296 steps/s, 296 tok/s)
+- GPU forward: ~2ms, CPU overhead: ~1.4ms
+
+### Eagle3 step breakdown
+- **18.0ms/step** (55 steps/s × 3.11 tok/step = 171 tok/s)
+
+| Component        | GPU (ms) | CPU (ms) | Serial? |
+|------------------|----------|----------|---------|
+| Target forward   | 4.2      | —        | no      |
+| Rejection sample | 0.5      | —        | no      |
+| Drafter iter ×4  | 4×0.8=3.2| 4×2.0=8.0| **YES** |
+| Other overhead   | —        | ~2.0     | —       |
+| **Total**        | **7.9**  | **10.0** | —       |
+
+### Root cause: CPU↔GPU ping-pong in drafter loop
+
+Each drafter iteration needs the previous token → serial:
+```
+iter1: CPU metadata(2ms) → GPU fwd(0.8ms) → wait for token
+iter2: CPU metadata(2ms) → GPU fwd(0.8ms) → wait for token
+iter3: CPU metadata(2ms) → GPU fwd(0.8ms) → wait for token
+iter4: CPU metadata(2ms) → GPU fwd(0.8ms) → done
+= 4 × 2.8ms = 11.2ms serial drafter time
+```
+
+GPU is idle 71% of drafter phase, waiting for Python metadata
+rebuilds (`build_per_group_and_layer_attn_metadata`,
+`eagle_step_update_slot_mapping_and_metadata`).
+
+### Theoretical speedup if CPU overhead eliminated
+
+GPU-only step time: 7.9ms → 126 steps/s × 3.11 = 394 tok/s
+That's 1.33x over no-Eagle (296 tok/s). Eagle3 WOULD win if the
+CPU overhead were eliminated.
+
+### Potential optimizations (vLLM-level)
+
+1. **Precompute drafter metadata**: Build all 4 iterations' metadata
+   upfront before the first drafter forward, eliminating per-iteration
+   Python overhead.
+
+2. **Fuse drafter iterations into a CUDA graph**: Capture all 4
+   sequential drafter forwards as one graph. Metadata in persistent
+   buffers updated once before replay.
+
+3. **Reduce K**: K=2 instead of K=4 would halve drafter overhead
+   (2×2.8 = 5.6ms) while keeping the higher per-position acceptance
+   rates (74%, 53%). Expected: ~11ms/step → ~2.05 tok/step → 186 tok/s.
+   Still below no-Eagle.
+
+4. **K=1**: Single drafter iteration, 2.8ms drafter overhead.
+   ~8.5ms/step → ~1.74 tok/step → 205 tok/s. Getting closer but
+   still below no-Eagle 296.
+
 ## TODO
 
 - Test K=1 and K=2 to find breakeven point
 - Test T=0.6 for acceptance rate improvement
-- Profile drafter forward time vs target forward time
-- Test with `--max-num-seqs 32` (higher concurrency favors spec decode)
+- Test with `--max-num-seqs 32` (higher concurrency)
+- Profile `build_per_group_and_layer_attn_metadata` to confirm 2ms/call
