@@ -132,9 +132,38 @@ CPU overhead were eliminated.
    ~8.5ms/step → ~1.74 tok/step → 205 tok/s. Getting closer but
    still below no-Eagle 296.
 
+## Detailed profiling: execute_model breakdown (p=1, H100)
+
+| Component        | Eagle3 (ms) | No-Eagle (ms) | Delta    |
+|------------------|-------------|---------------|----------|
+| update_states    | 0.16        | 0.11          | +0.05    |
+| prepare_inputs   | 1.68        | 0.65          | +1.03    |
+| **attn_meta**    | **5.68**    | **0.80**      | **+4.88**|
+| other_pre        | 0.79        | 1.05          | -0.26    |
+| **execute_model**| **8.3**     | **2.6**       | **+5.7** |
+| unaccounted*     | 9.5         | 0.8           | +8.7     |
+| **Total step**   | **17.8**    | **3.4**       | **+14.4**|
+
+*unaccounted = sample_tokens + drafter + engine scheduling
+
+### Root cause 1: _build_attention_metadata (5.7ms vs 0.8ms)
+
+7x slower with Eagle3. Builds per-layer metadata for 52 layers
+with K+1=5 tokens per request + spec_decode_common_attn_metadata.
+
+### Root cause 2: sample_tokens overhead (9.5ms vs 0.8ms)
+
+Includes rejection sampling bookkeeping, drafter (1.7ms),
+_copy_draft_token_ids_to_cpu D2H sync, engine scheduling.
+
+### Drafter loop is NOT the bottleneck (1.7ms total)
+
+Metadata caching optimization confirmed: build_per_group dropped
+from ~2ms to 0.02ms, but zero impact on step time.
+
 ## TODO
 
-- Test K=1 and K=2 to find breakeven point
-- Test T=0.6 for acceptance rate improvement
-- Test with `--max-num-seqs 32` (higher concurrency)
-- Profile `build_per_group_and_layer_attn_metadata` to confirm 2ms/call
+- Profile _build_attention_metadata internals
+- Profile sample_tokens breakdown
+- Test K=1 and K=2
+- File upstream vLLM issue with profiling data

@@ -3911,6 +3911,8 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        import time as _ptime
+        _em_t0 = _ptime.perf_counter()
         # Ensure all GPU work from the previous step (including spec
         # decode side-stream copies) is complete before modifying
         with (
@@ -3919,6 +3921,7 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            _em_t_update = _ptime.perf_counter()
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3964,6 +3967,7 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            _em_t_prep = _ptime.perf_counter()
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4086,6 +4090,7 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            _em_t_attn = _ptime.perf_counter()
 
             (
                 input_ids,
@@ -4180,6 +4185,20 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+            _em_t_fwd = _ptime.perf_counter()
+
+            # --- Profiling: wall-clock step timer ---
+            if not hasattr(self, '_prof_step_count'):
+                self._prof_step_count = 0
+                self._prof_step_start = _ptime.perf_counter()
+                self._prof_sums = {"update": 0, "prep": 0, "attn_meta": 0, "other_pre": 0, "fwd": 0}
+            self._prof_step_count += 1
+            self._prof_sums["update"] += _em_t_update - _em_t0
+            self._prof_sums["prep"] += _em_t_prep - _em_t_update
+            self._prof_sums["attn_meta"] += _em_t_attn - _em_t_prep
+            self._prof_sums["other_pre"] += _em_t_fwd - _em_t_attn  # dispatch+slots+preprocess
+            self._prof_sums["fwd"] += _ptime.perf_counter() - _em_t_fwd  # negligible (async)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4475,6 +4494,25 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
+
+        # --- Profiling: wall-clock log every 100 steps ---
+        if self._prof_step_count % 100 == 0 and self._prof_step_count > 0:
+            import time as _time_mod
+            elapsed = _time_mod.perf_counter() - self._prof_step_start
+            steps_per_sec = 100 / elapsed
+            ms_per_step = elapsed / 100 * 1000
+            parts = " ".join(
+                f"{k}={v/100*1000:.2f}ms" for k, v in self._prof_sums.items()
+            )
+            accounted = sum(self._prof_sums.values()) / 100 * 1000
+            logger.info(
+                "PROFILE step=%d: %.1f steps/s %.1fms/step | "
+                "execute_model: %s (%.1fms) | unaccounted=%.1fms",
+                self._prof_step_count, steps_per_sec, ms_per_step,
+                parts, accounted, ms_per_step - accounted,
+            )
+            self._prof_step_start = _time_mod.perf_counter()
+            self._prof_sums = {k: 0 for k in self._prof_sums}
 
         # Record event after all GPU work in sample_tokens()
         # (commit_boundary_states, drafter, bookkeeping) so the
