@@ -154,8 +154,13 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
 
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
-        if self.use_spec_decode:
-            self.supports_update_block_table = False
+        # Note: supports_update_block_table stays True even with spec
+        # decode. The update_block_table path reuses all spec decode
+        # fields (num_accepted_tokens, query_start_loc_d, block_idx_*)
+        # from the first layer's build, then copies them to this
+        # layer's persistent buffers in _update_metadata_for_cudagraph_capture.
+        # All mamba layers share the same spec decode metadata since
+        # only the block table (state_indices) differs per layer.
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -556,12 +561,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> M:
-        state_indices_tensor = mamba_get_block_table_tensor(
-            blk_table,
-            metadata.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
+        if self.vllm_config.cache_config.mamba_cache_mode == "all":
+            state_indices_tensor = blk_table
+        else:
+            state_indices_tensor = mamba_get_block_table_tensor(
+                blk_table,
+                metadata.seq_lens,
+                self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
         if state_indices_tensor.dim() == 1:
             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
