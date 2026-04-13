@@ -4150,13 +4150,62 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
+            # Cache attn_metadata for pure decode steps. Skip the
+            # full 30-layer Python build loop when the batch layout
+            # hasn't changed. Only update block_idx tensors.
+            _is_pure_decode = (
+                max_num_scheduled_tokens <= self.uniform_decode_query_len
+                and not scheduler_output.finished_req_ids
+                and not scheduler_output.scheduled_new_reqs
+            )
+            _cache_hit = (
+                _is_pure_decode
+                and hasattr(self, '_cached_attn_meta')
+                and self._cached_attn_meta is not None
+                and self._cached_attn_meta_num_reqs == num_reqs
+            )
+            if _cache_hit:
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._cached_attn_meta)
+                # Update max_seq_len on cached metadata
+                max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+                for md in attn_metadata.values():
+                    if hasattr(md, 'max_seq_len'):
+                        md.max_seq_len = max_seq_len
+                    if hasattr(md, 'seq_lens'):
+                        md.seq_lens = self.seq_lens[:num_reqs_padded]
+                # Recompute block_idx for mamba layers
+                if self._pc_spec_layers and self.cache_config.mamba_cache_mode == "all":
+                    num_computed = (
+                        self.seq_lens[:num_reqs_padded]
+                        - (self.query_start_loc.gpu[1:num_reqs_padded+1]
+                           - self.query_start_loc.gpu[:num_reqs_padded])
+                    )
+                    bs = self.cache_config.mamba_block_size
+                    blk_last_computed = torch.clamp(
+                        (num_computed + bs - 1) // bs - 1, min=0)
+                    blk_last_scheduled = torch.clamp(
+                        (self.seq_lens[:num_reqs_padded] + bs - 1) // bs - 1,
+                        min=0)
+                    # Update persistent buffers (shared across layers)
+                    for layer_name, md in attn_metadata.items():
+                        if hasattr(md, 'block_idx_last_computed_token'):
+                            nd = md.num_decodes
+                            if md.block_idx_last_computed_token is not None:
+                                md.block_idx_last_computed_token[:nd] = (
+                                    blk_last_computed[:nd])
+                            if md.block_idx_last_scheduled_token is not None:
+                                md.block_idx_last_scheduled_token[:nd] = (
+                                    blk_last_scheduled[:nd])
+                            break  # shared buffers, update once
+            else:
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded if pad_attn else None,
+                        max_query_len=max_num_scheduled_tokens,
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
                     use_spec_decode=use_spec_decode,
@@ -4165,6 +4214,12 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+                if _is_pure_decode:
+                    self._cached_attn_meta = (
+                        attn_metadata, spec_decode_common_attn_metadata)
+                    self._cached_attn_meta_num_reqs = num_reqs
+                else:
+                    self._cached_attn_meta = None
             _em_t_attn = _ptime.perf_counter()
 
             (
