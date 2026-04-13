@@ -2397,11 +2397,44 @@ class GPUModelRunner(
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
-                attn_metadata_i = builder.update_block_table(
-                    cached_attn_metadata[cache_key],
-                    common_attn_metadata.block_table_tensor,
-                    common_attn_metadata.slot_mapping,
-                )
+                # First call per cache_key: full update_block_table.
+                # Subsequent mamba builders on PURE DECODE: fast path
+                # — only state_indices_tensor_d differs per layer;
+                # all other fields are shared persistent buffers.
+                if cache_key not in _ubt_done:
+                    attn_metadata_i = builder.update_block_table(
+                        cached_attn_metadata[cache_key],
+                        common_attn_metadata.block_table_tensor,
+                        common_attn_metadata.slot_mapping,
+                    )
+                    _ubt_done[cache_key] = attn_metadata_i
+                elif (hasattr(builder, 'state_indices_tensor_d')
+                      and _ubt_done[cache_key].num_prefills == 0):
+                    # Pure decode fast path: copy block table to this
+                    # layer's persistent buffer, replace only the
+                    # per-layer field. Safe because all other fields
+                    # (query_start_loc_d, num_accepted_tokens,
+                    # block_idx_*) are shared persistent buffers
+                    # already written by the first builder.
+                    base = _ubt_done[cache_key]
+                    bt = common_attn_metadata.block_table_tensor
+                    nd = base.num_decodes
+                    ps = base.num_reqs
+                    builder.state_indices_tensor_d[:nd].copy_(
+                        bt[:nd], non_blocking=True)
+                    if ps > nd:
+                        builder.state_indices_tensor_d[nd:ps] = 0
+                    attn_metadata_i = replace(
+                        base,
+                        state_indices_tensor_d=(
+                            builder.state_indices_tensor_d[:ps]),
+                    )
+                else:
+                    attn_metadata_i = builder.update_block_table(
+                        cached_attn_metadata[cache_key],
+                        common_attn_metadata.block_table_tensor,
+                        common_attn_metadata.slot_mapping,
+                    )
             else:
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
@@ -2423,6 +2456,7 @@ class GPUModelRunner(
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        _ubt_done: dict = {}  # first update_block_table result per cache_key
         spec_decode_common_attn_metadata = None
         num_groups = len(kv_cache_groups)
         for kv_cache_gid in range(num_groups):
@@ -3978,8 +4012,10 @@ class GPUModelRunner(
             # modifies the batch (condense/remove). The stashed indices
             # reference the previous step's batch layout.
             if hasattr(self, '_deferred_commit') and self._deferred_commit is not None:
-                if self.sample_complete_event is not None:
-                    self.sample_complete_event.synchronize()
+                # No CPU sync needed: the masked Triton commit kernel
+                # runs entirely on GPU. CUDA stream ordering guarantees
+                # it sees the previous step's num_accepted_tokens
+                # (written by the rejection sampler on the same stream).
                 num_accepted_gpu, (state_indices_d, num_computed_d) = self._deferred_commit
                 self._deferred_commit = None
                 bs = self.cache_config.mamba_block_size
