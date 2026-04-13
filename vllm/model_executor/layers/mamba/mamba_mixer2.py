@@ -1262,6 +1262,43 @@ class MambaMixer2(MambaBase, PluggableLayer):
             0, pool_slot,
             spec_conv.index_select(0, src_slot))
 
+    def commit_boundary_masked(
+        self,
+        src_slot: torch.Tensor,
+        pool_slot: torch.Tensor,
+        needs_commit: torch.Tensor,
+    ):
+        """Commit using torch.where — fully GPU-side, no CPU sync.
+
+        Computes for ALL requests but only writes where needs_commit
+        is True. Non-committed requests read/write same pool data
+        (semantic no-op). Zero .any()/.nonzero() calls."""
+        if not self._pc_spec_enabled or self.spec_ssm is None:
+            return
+
+        # SSM state: pool[pool_slot] = where(mask, spec[src], pool[pool_slot])
+        ssm_pool = self.kv_cache[1]
+        pool_rows = ssm_pool[pool_slot]           # [N, ...]
+        spec_rows = self.spec_ssm[src_slot]       # [N, ...]
+        # Broadcast mask to match state dimensions
+        mask = needs_commit
+        while mask.dim() < pool_rows.dim():
+            mask = mask.unsqueeze(-1)
+        ssm_pool[pool_slot] = torch.where(mask, spec_rows, pool_rows)
+
+        # Conv state (possibly transposed)
+        pool_conv = self.kv_cache[0]
+        spec_conv = self.spec_conv
+        if not is_conv_state_dim_first():
+            pool_conv = pool_conv.transpose(-1, -2)
+            spec_conv = spec_conv.transpose(-1, -2)
+        pool_c_rows = pool_conv[pool_slot]
+        spec_c_rows = spec_conv[src_slot]
+        mask_c = needs_commit
+        while mask_c.dim() < pool_c_rows.dim():
+            mask_c = mask_c.unsqueeze(-1)
+        pool_conv[pool_slot] = torch.where(mask_c, spec_c_rows, pool_c_rows)
+
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
         assert self.cache_config is not None
