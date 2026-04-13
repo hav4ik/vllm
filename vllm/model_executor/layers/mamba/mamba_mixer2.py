@@ -1241,6 +1241,27 @@ class MambaMixer2(MambaBase, PluggableLayer):
             0, pool_slot,
             spec_conv.index_select(0, src_slot))
 
+    def commit_boundary_fast(
+        self,
+        src_slot: torch.Tensor,
+        pool_slot: torch.Tensor,
+    ):
+        """Minimal commit: just the two index_copy_ per layer.
+        Caller pre-computes src_slot/pool_slot once for all layers."""
+        if not self._pc_spec_enabled or self.spec_ssm is None:
+            return
+        self.kv_cache[1].index_copy_(
+            0, pool_slot,
+            self.spec_ssm.index_select(0, src_slot))
+        pool_conv = self.kv_cache[0]
+        spec_conv = self.spec_conv
+        if not is_conv_state_dim_first():
+            pool_conv = pool_conv.transpose(-1, -2)
+            spec_conv = spec_conv.transpose(-1, -2)
+        pool_conv.index_copy_(
+            0, pool_slot,
+            spec_conv.index_select(0, src_slot))
+
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
         assert self.cache_config is not None

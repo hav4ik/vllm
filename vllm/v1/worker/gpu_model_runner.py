@@ -852,6 +852,26 @@ class GPUModelRunner(
                     pin_memory=self.pin_memory,
                 )
 
+            # Pre-allocated buffers for _calc_spec_decode_metadata to avoid
+            # repeated torch.from_numpy().to(device) allocations per step.
+            # Each buffer holds a different spec decode index array. Using
+            # CpuGpuBuffer with pinned CPU memory enables non_blocking copies.
+            self._sd_cu_num_draft = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._sd_cu_num_sampled = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._sd_logits_indices = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int64
+            )
+            self._sd_target_logits_indices = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
+            self._sd_bonus_logits_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+
         # Model weight offloader
         # Make sure this is called before any get_offloader call
         set_offloader(create_offloader(self.offload_config))
@@ -1509,9 +1529,6 @@ class GPUModelRunner(
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
-        # TODO: Remove .cpu() sync to enable fully async for hybrid model;
-        # Use num_computed_tokens.gpu instead of req.num_computed_tokens to
-        # support aligned mamba cache mode.
         # Find the number of accepted tokens for each sequence.
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (
@@ -1556,8 +1573,8 @@ class GPUModelRunner(
             self.num_accepted_tokens_event.record()
 
             # PC + spec: commit boundary states from spec slots → pool.
-            # Pre-compute needs_commit and indices ONCE to avoid 23x
-            # D2H syncs from .any()/.nonzero() inside each layer.
+            # Pre-compute ALL indices once (no D2H syncs — .nonzero()
+            # returns a GPU tensor; .numel() is metadata, no sync).
             if self._pc_spec_layers and self._spec_commit_stash is not None:
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
                 bs = self.cache_config.mamba_block_size
@@ -1568,14 +1585,21 @@ class GPUModelRunner(
                 blk_current = n_done // bs
                 boundary_pos = (blk_current + 1) * bs - 1
                 needs_commit = boundary_pos < (n_done + n_acc)
-                if needs_commit.any():  # single D2H sync
-                    ix = needs_commit.nonzero(as_tuple=True)[0]
+                ix = needs_commit.nonzero(as_tuple=True)[0]
+                # Hoist src_slot/pool_slot computation (identical for
+                # all layers — depends only on block table + positions).
+                if ix.numel() > 0:
+                    layer0 = self._pc_spec_layers[0]
+                    cand_idx = (boundary_pos[ix] - n_done[ix]).clamp(
+                        min=0, max=layer0.num_spec)
+                    base = layer0._spec_base_long[:N]
+                    src_slot = base[ix] + cand_idx.long()
+                    pool_slot = state_indices_d.gather(
+                        1, blk_current[ix].unsqueeze(1).to(torch.int64)
+                    ).squeeze(1).long()
                     for layer in self._pc_spec_layers:
-                        layer.commit_boundary_states_precomputed(
-                            num_accepted_gpu, bs,
-                            state_indices_d, num_computed_d,
-                            ix, blk_current, boundary_pos, n_done, N,
-                        )
+                        layer.commit_boundary_fast(
+                            src_slot, pool_slot)
                 self._spec_commit_stash = None
 
     def _update_streaming_request(
@@ -2400,8 +2424,21 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
-        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
-            cm = copy(cm_base)  # shallow copy
+        num_groups = len(kv_cache_groups)
+        for kv_cache_gid in range(num_groups):
+            kv_cache_group = kv_cache_groups[kv_cache_gid]
+            # For the first group, use cm_base directly to avoid a shallow
+            # copy. This is safe: cm_base is not read after this loop, and
+            # subsequent groups copy from cm_base (which retains gid=0's
+            # encoder_seq_lens, but each copy overwrites it immediately).
+            # For subsequent groups, shallow-copy and update the fields
+            # that differ (block_table, slot_mapping, encoder_seq_lens).
+            if kv_cache_gid == 0:
+                cm = cm_base
+            else:
+                cm = copy(cm_base)
+                cm.block_table_tensor = _get_block_table(kv_cache_gid)
+                cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -2411,9 +2448,6 @@ class GPUModelRunner(
                 num_reqs_padded,
                 for_cudagraph_capture=for_cudagraph_capture,
             )
-            if kv_cache_gid > 0:
-                cm.block_table_tensor = _get_block_table(kv_cache_gid)
-                cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
@@ -2734,36 +2768,46 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
 
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
-        )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
-        )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
-        )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
-        )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
-        )
+        # Use pre-allocated CpuGpuBuffers instead of torch.from_numpy().to()
+        # to avoid temporary tensor allocations per step. The numpy arrays are
+        # copied into the pinned CPU buffer, then async-copied to GPU.
+        num_reqs = len(num_draft_tokens)
+        total_sampled = int(cu_num_sampled_tokens[-1])
+        total_draft = int(cu_num_draft_tokens[-1])
+
+        self._sd_cu_num_draft.np[:num_reqs] = cu_num_draft_tokens
+        self._sd_cu_num_draft.copy_to_gpu(num_reqs)
+        cu_num_draft_gpu = self._sd_cu_num_draft.gpu[:num_reqs]
+
+        self._sd_cu_num_sampled.np[:num_reqs] = cu_num_sampled_tokens
+        self._sd_cu_num_sampled.copy_to_gpu(num_reqs)
+        cu_num_sampled_gpu = self._sd_cu_num_sampled.gpu[:num_reqs]
+
+        self._sd_logits_indices.np[:total_sampled] = logits_indices
+        self._sd_logits_indices.copy_to_gpu(total_sampled)
+        logits_indices_gpu = self._sd_logits_indices.gpu[:total_sampled]
+
+        self._sd_target_logits_indices.np[:total_draft] = target_logits_indices
+        self._sd_target_logits_indices.copy_to_gpu(total_draft)
+        target_logits_indices_gpu = self._sd_target_logits_indices.gpu[:total_draft]
+
+        self._sd_bonus_logits_indices.np[:num_reqs] = bonus_logits_indices
+        self._sd_bonus_logits_indices.copy_to_gpu(num_reqs)
+        bonus_logits_indices_gpu = self._sd_bonus_logits_indices.gpu[:num_reqs]
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_ids = self.input_ids.gpu[logits_indices_gpu]
+        draft_token_ids = draft_token_ids[target_logits_indices_gpu + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            cu_num_sampled_tokens=cu_num_sampled_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
+            cu_num_draft_tokens=cu_num_draft_gpu,
+            cu_num_sampled_tokens=cu_num_sampled_gpu,
+            target_logits_indices=target_logits_indices_gpu,
+            bonus_logits_indices=bonus_logits_indices_gpu,
+            logits_indices=logits_indices_gpu,
         )
 
     def _prepare_kv_sharing_fast_prefill(
