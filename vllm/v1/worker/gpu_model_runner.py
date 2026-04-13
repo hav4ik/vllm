@@ -1580,30 +1580,18 @@ class GPUModelRunner(
             # Compute indices for ALL requests, then conditionally
             # write using the needs_commit mask.
             if self._pc_spec_layers and self._spec_commit_stash is not None:
-                num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
-                bs = self.cache_config.mamba_block_size
-                state_indices_d, num_computed_d = self._spec_commit_stash
+                # Stash for post-drafter commit (fire-and-forget GPU ops)
+                self._pending_commit = (
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self._spec_commit_stash,
+                )
                 self._spec_commit_stash = None
-                N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
-                n_done = num_computed_d[:N]
-                n_acc = num_accepted_gpu[:N]
-                blk_current = n_done // bs
-                boundary_pos = (blk_current + 1) * bs - 1
-                needs_commit = boundary_pos < (n_done + n_acc)
-
-                # Compute src_slot/pool_slot for ALL requests.
-                # Non-committed requests get needs_commit=False so
-                # torch.where writes back the existing pool value.
-                # Clamp pool_slot to min=1 to avoid reading/writing
-                # NULL block 0 (which is shared padding state).
+            if False:  # dead code from previous approach
                 layer0 = self._pc_spec_layers[0]
-                cand_idx = (boundary_pos - n_done).clamp(
-                    min=0, max=layer0.num_spec)
-                base = layer0._spec_base_long[:N]
-                src_slot = base + cand_idx.long()
-                pool_slot = state_indices_d.gather(
-                    1, blk_current.unsqueeze(1).to(torch.int64)
-                ).squeeze(1).long()
+                cand_idx = None
+                base = layer0._spec_base_long[:1]
+                src_slot = base
+                pool_slot = base
                 # For non-committed requests, redirect to their OWN
                 # first block (always valid & unique) so torch.where
                 # reads/writes their own block — no cross-request
@@ -4629,6 +4617,35 @@ class GPUModelRunner(
         # draft model to also save its KV cache.
         if spec_config is not None:
             self.finalize_kv_connector()
+
+        # PC + spec: execute commit AFTER drafter. All GPU ops
+        # (forward, sampling, drafter) are queued. The commit ops
+        # queue behind them on the same stream. CPU just launches
+        # and moves on — zero sync.
+        if hasattr(self, '_pending_commit') and self._pending_commit is not None:
+            num_accepted_gpu, (state_indices_d, num_computed_d) = (
+                self._pending_commit)
+            self._pending_commit = None
+            bs = self.cache_config.mamba_block_size
+            N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
+            n_done = num_computed_d[:N]
+            n_acc = num_accepted_gpu[:N]
+            blk_current = n_done // bs
+            boundary_pos = (blk_current + 1) * bs - 1
+            needs_commit = boundary_pos < (n_done + n_acc)
+            layer0 = self._pc_spec_layers[0]
+            cand_idx = (boundary_pos - n_done).clamp(
+                min=0, max=layer0.num_spec)
+            base = layer0._spec_base_long[:N]
+            src_slot = base + cand_idx.long()
+            pool_slot = state_indices_d.gather(
+                1, blk_current.unsqueeze(1).to(torch.int64)
+            ).squeeze(1).long()
+            safe_slot = state_indices_d[:N, 0].long().clamp(min=1)
+            pool_slot = torch.where(needs_commit, pool_slot, safe_slot)
+            for layer in self._pc_spec_layers:
+                layer.commit_boundary_masked(
+                    src_slot, pool_slot, needs_commit)
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
