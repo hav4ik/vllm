@@ -1202,6 +1202,45 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 0, pool_slot[ix],
                 spec_conv.index_select(0, src_slot[ix]))
 
+    def commit_boundary_states_precomputed(
+        self,
+        num_accepted: torch.Tensor,
+        block_size: int,
+        state_indices_d: torch.Tensor,
+        num_computed_d: torch.Tensor,
+        ix: torch.Tensor,
+        blk_current: torch.Tensor,
+        boundary_pos: torch.Tensor,
+        n_done: torch.Tensor,
+        N: int,
+    ):
+        """Like commit_boundary_states but with pre-computed ix/blk_current
+        to avoid per-layer D2H syncs from .any()/.nonzero()."""
+        if not self._pc_spec_enabled or self.spec_ssm is None:
+            return
+        if ix.numel() == 0:
+            return
+
+        cand_idx = (boundary_pos[ix] - n_done[ix]).clamp(
+            min=0, max=self.num_spec)
+        base = self._spec_base_long[:N]
+        src_slot = base[ix] + cand_idx.long()
+        pool_slot = state_indices_d.gather(
+            1, blk_current[ix].unsqueeze(1).to(torch.int64)
+        ).squeeze(1).long()
+
+        self.kv_cache[1].index_copy_(
+            0, pool_slot,
+            self.spec_ssm.index_select(0, src_slot))
+        pool_conv = self.kv_cache[0]
+        spec_conv = self.spec_conv
+        if not is_conv_state_dim_first():
+            pool_conv = pool_conv.transpose(-1, -2)
+            spec_conv = spec_conv.transpose(-1, -2)
+        pool_conv.index_copy_(
+            0, pool_slot,
+            spec_conv.index_select(0, src_slot))
+
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         assert self.model_config is not None
         assert self.cache_config is not None

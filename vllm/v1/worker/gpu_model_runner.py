@@ -1556,15 +1556,26 @@ class GPUModelRunner(
             self.num_accepted_tokens_event.record()
 
             # PC + spec: commit boundary states from spec slots → pool.
+            # Pre-compute needs_commit and indices ONCE to avoid 23x
+            # D2H syncs from .any()/.nonzero() inside each layer.
             if self._pc_spec_layers and self._spec_commit_stash is not None:
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
                 bs = self.cache_config.mamba_block_size
                 state_indices_d, num_computed_d = self._spec_commit_stash
-                for layer in self._pc_spec_layers:
-                    layer.commit_boundary_states(
-                        num_accepted_gpu, bs,
-                        state_indices_d, num_computed_d,
-                    )
+                N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
+                n_done = num_computed_d[:N]
+                n_acc = num_accepted_gpu[:N]
+                blk_current = n_done // bs
+                boundary_pos = (blk_current + 1) * bs - 1
+                needs_commit = boundary_pos < (n_done + n_acc)
+                if needs_commit.any():  # single D2H sync
+                    ix = needs_commit.nonzero(as_tuple=True)[0]
+                    for layer in self._pc_spec_layers:
+                        layer.commit_boundary_states_precomputed(
+                            num_accepted_gpu, bs,
+                            state_indices_d, num_computed_d,
+                            ix, blk_current, boundary_pos, n_done, N,
+                        )
                 self._spec_commit_stash = None
 
     def _update_streaming_request(
@@ -4318,6 +4329,9 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        import time as _st
+        _st0 = _st.perf_counter()
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -4326,10 +4340,12 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        _st1 = _st.perf_counter()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        _st2 = _st.perf_counter()
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4346,7 +4362,9 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal _st_draft, _st_copy_cpu
             assert spec_decode_common_attn_metadata is not None
+            _d0 = _st.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4359,8 +4377,15 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                _d1 = _st.perf_counter()
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+                _d2 = _st.perf_counter()
+            _st_draft = _d1 - _d0
+            _st_copy_cpu = _d2 - _d1
 
+        _st_draft = 0.0
+        _st_copy_cpu = 0.0
+        _st3 = _st.perf_counter()
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
@@ -4436,6 +4461,7 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        _st4 = _st.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4453,6 +4479,7 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        _st5 = _st.perf_counter()
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4494,6 +4521,26 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
+
+        # --- Profiling: sample_tokens breakdown ---
+        _st6 = _st.perf_counter()
+        if not hasattr(self, '_st_sums'):
+            self._st_sums = {"sample": 0, "update": 0, "spec_logic": 0,
+                             "draft": 0, "copy_cpu": 0, "bookkeep": 0, "output": 0}
+            self._st_count = 0
+        self._st_count += 1
+        self._st_sums["sample"] += _st1 - _st0
+        self._st_sums["update"] += _st2 - _st1
+        self._st_sums["spec_logic"] += _st4 - _st3 - _st_draft - _st_copy_cpu
+        self._st_sums["draft"] += _st_draft
+        self._st_sums["copy_cpu"] += _st_copy_cpu
+        self._st_sums["bookkeep"] += _st5 - _st4
+        self._st_sums["output"] += _st6 - _st5
+        if self._st_count % 100 == 0:
+            parts = " ".join(f"{k}={v/100*1000:.2f}ms" for k, v in self._st_sums.items())
+            total_st = sum(self._st_sums.values()) / 100 * 1000
+            logger.info("SAMPLE_PROFILE step=%d: %s total=%.2fms", self._st_count, parts, total_st)
+            self._st_sums = {k: 0 for k in self._st_sums}
 
         # --- Profiling: wall-clock log every 100 steps ---
         if self._prof_step_count % 100 == 0 and self._prof_step_count > 0:
