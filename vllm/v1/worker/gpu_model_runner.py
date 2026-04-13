@@ -6605,6 +6605,38 @@ class GPUModelRunner(
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
+    def _bind_mamba_block_table_buffers(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        """Bind mamba metadata builders to their BlockTable GPU buffers.
+
+        For mamba layers with ``mamba_cache_mode == "all"`` and FULL
+        cudagraphs, this makes the builder's persistent
+        ``state_indices_tensor_d`` buffer point directly at the
+        ``BlockTable.block_table.gpu`` tensor.  Because
+        ``commit_block_table()`` writes fresh data to that same
+        address every step, the builder can skip the per-layer
+        ``copy_()`` in ``update_block_table`` /
+        ``_update_metadata_for_cudagraph_capture``, saving one CUDA
+        copy kernel per mamba layer per step.
+        """
+        if not hasattr(self.input_batch, "block_table"):
+            return
+        block_tables = self.input_batch.block_table
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+
+        for kv_cache_gid in range(len(kv_cache_groups)):
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            for attn_group in self.attn_groups[kv_cache_gid]:
+                for builder in attn_group.metadata_builders:
+                    if hasattr(builder, "bind_block_table_gpu_buffer"):
+                        bt = block_tables[kv_cache_gid]
+                        builder.bind_block_table_gpu_buffer(
+                            bt.block_table.gpu
+                        )
+
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
@@ -7091,6 +7123,12 @@ class GPUModelRunner(
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+        # Bind mamba metadata builders to their BlockTable GPU buffers.
+        # This lets the builder's persistent buffer *be* the block table
+        # buffer, eliminating per-layer copy_() in update_block_table.
+        self._bind_mamba_block_table_buffers(kv_cache_config)
+
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )

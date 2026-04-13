@@ -148,15 +148,24 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             # This only triggers under FULL cudagraphs (e.g. FlashAttention on
             # H100); FlashInfer falls back to PIECEWISE and skips it.
             max_num_blocks += self.num_spec_tokens
-            # Per-layer: block table differs per mamba layer
-            self.state_indices_tensor_d: torch.Tensor = torch.empty(
+            # Per-layer: block table differs per mamba layer.
+            # Pre-fill with NULL_BLOCK_ID so that padding rows are always
+            # correct; only the active rows [0:num_decodes] are overwritten
+            # by copy_() each step.  This eliminates one fill_ kernel per
+            # update_block_table call in steady-state (when num_decodes
+            # does not shrink).
+            self.state_indices_tensor_d: torch.Tensor = torch.full(
                 (
                     self.decode_cudagraph_max_bs,
                     max_num_blocks,
                 ),
+                NULL_BLOCK_ID,
                 dtype=torch.int32,
                 device=device,
             )
+            # Track the high-water mark of valid rows so we only re-fill
+            # the stale region when the decode batch shrinks.
+            self._sid_last_num_decodes: int = 0
             # Shared: block indices are identical across mamba layers
             self.block_idx_last_scheduled_token: torch.Tensor = (
                 self._get_shared_persistent_buffer(
@@ -175,11 +184,13 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 )
             )
         else:
-            self.state_indices_tensor_d = torch.empty(
+            self.state_indices_tensor_d = torch.full(
                 (self.decode_cudagraph_max_bs, 1 + self.num_spec_tokens),
+                NULL_BLOCK_ID,
                 dtype=torch.int32,
                 device=device,
             )
+            self._sid_last_num_decodes: int = 0
 
         # For speculative decoding, we need to store the following buffers
         # for CUDA graph capture during decode.
@@ -195,16 +206,53 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
 
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
-        # Note: supports_update_block_table stays True even with spec
-        # decode. The update_block_table path reuses all spec decode
-        # fields (num_accepted_tokens, query_start_loc_d, block_idx_*)
-        # from the first layer's build, then copies them to this
-        # layer's persistent buffers in _update_metadata_for_cudagraph_capture.
-        # All mamba layers share the same spec decode metadata since
-        # only the block table (state_indices) differs per layer.
-        # With shared persistent buffers, the update_block_table path
-        # can skip redundant copies for non-block-table fields.
+        # When True, state_indices_tensor_d is aliased to the
+        # BlockTable GPU buffer.  commit_block_table() writes data to
+        # the same address, so update_block_table / build can skip the
+        # copy_ into the persistent buffer entirely.
+        self._block_table_aliased: bool = False
 
+    def bind_block_table_gpu_buffer(
+        self,
+        block_table_gpu: torch.Tensor,
+    ) -> None:
+        """Replace the builder's persistent block-table buffer with a
+        view of the *real* BlockTable GPU buffer.
+
+        Only effective when ``mamba_cache_mode == "all"``, because in
+        that mode ``state_indices_tensor = block_table_tensor``
+        (a direct view).  In other modes the block table is
+        transformed by ``mamba_get_block_table_tensor``, so the
+        aliasing trick does not apply.
+
+        After this call, cudagraph capture will bake in the BlockTable
+        buffer address.  During replay ``commit_block_table()`` writes
+        fresh data to that same address, so
+        ``_update_metadata_for_cudagraph_capture`` /
+        ``update_block_table`` can skip the per-layer ``copy_()``.
+
+        Args:
+            block_table_gpu: The ``BlockTable.block_table.gpu`` tensor
+                for this builder's KV-cache group.  Shape is
+                ``(max_num_reqs, max_num_blocks_per_req)``.
+        """
+        if self.vllm_config.cache_config.mamba_cache_mode != "all":
+            return  # aliasing only safe in "all" mode
+        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            return  # no persistent buffer needed without FULL CGs
+
+        max_bs = self.decode_cudagraph_max_bs
+        # Safety: ensure the source buffer is at least as large as the
+        # slice the builder will reference.
+        if (block_table_gpu.shape[0] < max_bs
+                or block_table_gpu.shape[1]
+                < self.state_indices_tensor_d.shape[1]):
+            return  # shape mismatch -- fall back to copy path
+        # Replace with a view (same data_ptr, correct shape).
+        self.state_indices_tensor_d = block_table_gpu[
+            :max_bs, : self.state_indices_tensor_d.shape[1]
+        ]
+        self._block_table_aliased = True
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -554,36 +602,56 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             padded_bs = metadata.num_reqs
-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
-                state_indices_tensor_d, non_blocking=True
-            )
-            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
-            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+            nd = metadata.num_decodes
+
+            if self._block_table_aliased:
+                # The persistent buffer IS the BlockTable GPU buffer.
+                # commit_block_table() + _get_block_table() have already
+                # written the correct data (including NULL_BLOCK_ID
+                # padding).  No copy or fill needed.
+                state_indices_tensor_d = self.state_indices_tensor_d[
+                    :padded_bs
+                ]
+            else:
+                self.state_indices_tensor_d[:nd].copy_(
+                    state_indices_tensor_d, non_blocking=True
+                )
+                # The persistent buffer was pre-filled with NULL_BLOCK_ID
+                # at init.  Only re-fill the stale region when the decode
+                # batch shrinks.
+                if nd < self._sid_last_num_decodes:
+                    self.state_indices_tensor_d[
+                        nd : self._sid_last_num_decodes
+                    ].fill_(NULL_BLOCK_ID)
+                self._sid_last_num_decodes = nd
+                state_indices_tensor_d = self.state_indices_tensor_d[
+                    :padded_bs
+                ]
 
             if self.use_spec_decode and num_accepted_tokens is not None:
                 assert query_start_loc_d is not None
                 query_start_loc_d = query_start_loc_d[: padded_bs + 1]
-                self.decode_num_accepted_tokens[: metadata.num_decodes].copy_(
+                self.decode_num_accepted_tokens[:nd].copy_(
                     num_accepted_tokens, non_blocking=True
                 )
                 num_accepted_tokens = self.decode_num_accepted_tokens[:padded_bs]
-                num_accepted_tokens[metadata.num_decodes :] = (
+                num_accepted_tokens[nd :] = (
                     1  # pad with 1st slot index
                 )
 
             if self.vllm_config.cache_config.mamba_cache_mode == "all":
                 assert block_idx_last_scheduled_token is not None
                 assert block_idx_last_computed_token is not None
-                self.block_idx_last_scheduled_token[: metadata.num_decodes].copy_(
-                    block_idx_last_scheduled_token[: metadata.num_decodes],
+                self.block_idx_last_scheduled_token[:nd].copy_(
+                    block_idx_last_scheduled_token[:nd],
                     non_blocking=True,
                 )
                 block_idx_last_scheduled_token = self.block_idx_last_scheduled_token[
                     : metadata.num_decode_tokens
                 ]
 
-                self.block_idx_last_computed_token[: metadata.num_decodes].copy_(
-                    block_idx_last_computed_token[: metadata.num_decodes],
+                self.block_idx_last_computed_token[:nd].copy_(
+                    block_idx_last_computed_token[:nd],
                     non_blocking=True,
                 )
                 block_idx_last_computed_token = self.block_idx_last_computed_token[
@@ -656,13 +724,30 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             padded_bs = metadata.num_reqs
+            nd = metadata.num_decodes
 
-            # Per-layer: copy this layer's block table to its persistent buffer
-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
-                state_indices_tensor_d, non_blocking=True
-            )
-            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
-            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+            if self._block_table_aliased:
+                # The persistent buffer IS the BlockTable GPU buffer.
+                # commit_block_table() + _get_block_table() have already
+                # written the correct data.  No copy or fill needed.
+                state_indices_tensor_d = self.state_indices_tensor_d[
+                    :padded_bs
+                ]
+            else:
+                # Per-layer: copy this layer's block table to its
+                # persistent buffer.  Pre-filled with NULL_BLOCK_ID at
+                # init; only re-fill stale rows on batch shrink.
+                self.state_indices_tensor_d[:nd].copy_(
+                    state_indices_tensor_d, non_blocking=True
+                )
+                if nd < self._sid_last_num_decodes:
+                    self.state_indices_tensor_d[
+                        nd : self._sid_last_num_decodes
+                    ].fill_(NULL_BLOCK_ID)
+                self._sid_last_num_decodes = nd
+                state_indices_tensor_d = self.state_indices_tensor_d[
+                    :padded_bs
+                ]
 
             if self.use_spec_decode and num_accepted_tokens is not None:
                 assert query_start_loc_d is not None
