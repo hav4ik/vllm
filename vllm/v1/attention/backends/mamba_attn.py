@@ -82,6 +82,35 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
     # Will be disabled if speculative decoding is used
     supports_update_block_table: bool = True
 
+    # Shared persistent buffers for fields that are identical across all
+    # mamba layers (num_accepted_tokens, block_idx_last_scheduled_token,
+    # block_idx_last_computed_token). Only the block table
+    # (state_indices_tensor_d) differs per layer and needs a per-builder
+    # buffer. Sharing eliminates redundant copy_() calls in
+    # update_block_table for layers 2..N (only the first layer's build()
+    # writes the data; subsequent layers reuse the same buffer address).
+    # Keyed by (device, decode_cudagraph_max_bs) to handle multi-device.
+    _shared_persistent_buffers: ClassVar[
+        dict[tuple[torch.device, int], dict[str, torch.Tensor]]
+    ] = {}
+
+    @classmethod
+    def _get_shared_persistent_buffer(
+        cls,
+        device: torch.device,
+        max_bs: int,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (device, max_bs)
+        if key not in cls._shared_persistent_buffers:
+            cls._shared_persistent_buffers[key] = {}
+        buffers = cls._shared_persistent_buffers[key]
+        if name not in buffers:
+            buffers[name] = torch.empty(shape, dtype=dtype, device=device)
+        return buffers[name]
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -119,6 +148,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             # This only triggers under FULL cudagraphs (e.g. FlashAttention on
             # H100); FlashInfer falls back to PIECEWISE and skips it.
             max_num_blocks += self.num_spec_tokens
+            # Per-layer: block table differs per mamba layer
             self.state_indices_tensor_d: torch.Tensor = torch.empty(
                 (
                     self.decode_cudagraph_max_bs,
@@ -127,15 +157,22 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int32,
                 device=device,
             )
-            self.block_idx_last_scheduled_token: torch.Tensor = torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.int32,
-                device=device,
+            # Shared: block indices are identical across mamba layers
+            self.block_idx_last_scheduled_token: torch.Tensor = (
+                self._get_shared_persistent_buffer(
+                    device, self.decode_cudagraph_max_bs,
+                    "block_idx_last_scheduled_token",
+                    (self.decode_cudagraph_max_bs,),
+                    torch.int32,
+                )
             )
-            self.block_idx_last_computed_token: torch.Tensor = torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.int32,
-                device=device,
+            self.block_idx_last_computed_token: torch.Tensor = (
+                self._get_shared_persistent_buffer(
+                    device, self.decode_cudagraph_max_bs,
+                    "block_idx_last_computed_token",
+                    (self.decode_cudagraph_max_bs,),
+                    torch.int32,
+                )
             )
         else:
             self.state_indices_tensor_d = torch.empty(
@@ -145,17 +182,29 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
 
         # For speculative decoding, we need to store the following buffers
-        # for CUDA graph capture during decode
+        # for CUDA graph capture during decode.
+        # Shared: num_accepted_tokens is identical across mamba layers.
         if self.num_spec_tokens > 0:
-            self.decode_num_accepted_tokens: torch.Tensor = torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.int32,
-                device=device,
+            self.decode_num_accepted_tokens: torch.Tensor = (
+                self._get_shared_persistent_buffer(
+                    device, self.decode_cudagraph_max_bs,
+                    "decode_num_accepted_tokens",
+                    (self.decode_cudagraph_max_bs,),
+                    torch.int32,
+                )
             )
 
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
-        if self.use_spec_decode:
-            self.supports_update_block_table = False
+        # Note: supports_update_block_table stays True even with spec
+        # decode. The update_block_table path reuses all spec decode
+        # fields (num_accepted_tokens, query_start_loc_d, block_idx_*)
+        # from the first layer's build, then copies them to this
+        # layer's persistent buffers in _update_metadata_for_cudagraph_capture.
+        # All mamba layers share the same spec decode metadata since
+        # only the block table (state_indices) differs per layer.
+        # With shared persistent buffers, the update_block_table path
+        # can skip redundant copies for non-block-table fields.
+
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -556,12 +605,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> M:
-        state_indices_tensor = mamba_get_block_table_tensor(
-            blk_table,
-            metadata.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
+        if self.vllm_config.cache_config.mamba_cache_mode == "all":
+            state_indices_tensor = blk_table
+        else:
+            state_indices_tensor = mamba_get_block_table_tensor(
+                blk_table,
+                metadata.seq_lens,
+                self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
         if state_indices_tensor.dim() == 1:
             state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
@@ -585,10 +637,63 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
 
-        new_metadata = replace(
+        # Only update the per-layer block table (state_indices_tensor_d)
+        # in the persistent buffer. The non-block-table fields
+        # (num_accepted_tokens, block_idx_last_scheduled_token,
+        # block_idx_last_computed_token) are shared persistent buffers
+        # already written by the first layer's build() call and are
+        # identical across all mamba layers -- skip redundant copies.
+        # query_start_loc_d is a view of the input and doesn't need
+        # copying to a persistent buffer.
+        query_start_loc_d = metadata.query_start_loc_d
+        num_accepted_tokens = metadata.num_accepted_tokens
+        block_idx_last_scheduled_token = metadata.block_idx_last_scheduled_token
+        block_idx_last_computed_token = metadata.block_idx_last_computed_token
+
+        if (
+            metadata.num_prefills == 0
+            and metadata.num_decodes <= self.decode_cudagraph_max_bs
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            padded_bs = metadata.num_reqs
+
+            # Per-layer: copy this layer's block table to its persistent buffer
+            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
+                state_indices_tensor_d, non_blocking=True
+            )
+            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
+            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+
+            if self.use_spec_decode and num_accepted_tokens is not None:
+                assert query_start_loc_d is not None
+                query_start_loc_d = query_start_loc_d[: padded_bs + 1]
+                # Shared buffer: num_accepted_tokens already written by
+                # first layer's build(). self.decode_num_accepted_tokens
+                # IS the shared buffer, so just reference it (no copy).
+                num_accepted_tokens = (
+                    self.decode_num_accepted_tokens[:padded_bs]
+                )
+
+            if self.vllm_config.cache_config.mamba_cache_mode == "all":
+                # Shared buffers: block_idx_* already written by first
+                # layer's build(). Just reference (no copy).
+                block_idx_last_scheduled_token = (
+                    self.block_idx_last_scheduled_token[
+                        : metadata.num_decode_tokens
+                    ]
+                )
+                block_idx_last_computed_token = (
+                    self.block_idx_last_computed_token[
+                        : metadata.num_decode_tokens
+                    ]
+                )
+
+        return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
             state_indices_tensor_p=state_indices_tensor_p,
+            query_start_loc_d=query_start_loc_d,
+            num_accepted_tokens=num_accepted_tokens,
+            block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+            block_idx_last_computed_token=block_idx_last_computed_token,
         )
-
-        return self._update_metadata_for_cudagraph_capture(new_metadata)

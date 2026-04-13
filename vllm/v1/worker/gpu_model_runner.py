@@ -852,6 +852,26 @@ class GPUModelRunner(
                     pin_memory=self.pin_memory,
                 )
 
+            # Pre-allocated buffers for _calc_spec_decode_metadata to avoid
+            # repeated torch.from_numpy().to(device) allocations per step.
+            # Each buffer holds a different spec decode index array. Using
+            # CpuGpuBuffer with pinned CPU memory enables non_blocking copies.
+            self._sd_cu_num_draft = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._sd_cu_num_sampled = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._sd_logits_indices = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int64
+            )
+            self._sd_target_logits_indices = self._make_buffer(
+                self.max_num_tokens, dtype=torch.int32
+            )
+            self._sd_bonus_logits_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+
         # Model weight offloader
         # Make sure this is called before any get_offloader call
         set_offloader(create_offloader(self.offload_config))
@@ -1459,22 +1479,40 @@ class GPUModelRunner(
         else:
             return None
 
-    def _get_mamba_spec_metadata(self):
-        """Get mamba attn_metadata for the spec layers, or None."""
-        from vllm.forward_context import get_forward_context
-        m = get_forward_context().attn_metadata
-        if m is None:
-            return None
-        assert isinstance(m, dict)
-        return m.get(self._pc_spec_layers[0].prefix)
+    def _build_spec_commit_stash(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Clone the metadata that commit_boundary_states needs, in eager
+        mode, before the captured forward runs.
 
-    def _build_spec_commit_stash(self, m):
-        """Clone commit metadata outside cudagraph capture."""
-        nd = m.num_decodes
-        state_indices_d = m.state_indices_tensor_d[:nd].clone()
-        qlen = (m.query_start_loc_d[1:] - m.query_start_loc_d[:-1]
-                if m.query_start_loc_d is not None else 1)
-        num_computed_d = (m.seq_lens[:nd] - qlen).clone()
+        The forward used to stash this internally via
+        ``self._spec_pending = (t.clone(), ...)``, but that Python
+        attribute assignment is invisible to cudagraph replay: after the
+        first commit sets it to None, the replay never reassigns it. By
+        cloning here (outside capture) and passing to commit as explicit
+        args, we avoid any Python side-effects in the captured region.
+        """
+        from vllm.forward_context import get_forward_context
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            return None
+        assert isinstance(attn_metadata, dict)
+        layer0 = self._pc_spec_layers[0]
+        m = attn_metadata.get(layer0.prefix)
+        if m is None or m.num_accepted_tokens is None:
+            return None
+        num_decodes = m.num_decodes
+        if num_decodes <= 0:
+            return None
+
+        state_indices_d = m.state_indices_tensor_d[:num_decodes].clone()
+        query_start_loc_d = m.query_start_loc_d
+        if query_start_loc_d is not None:
+            qlen = query_start_loc_d[1:] - query_start_loc_d[:-1]
+        else:
+            qlen = 1
+        num_computed_d = (m.seq_lens[:num_decodes] - qlen).clone()
         return (state_indices_d, num_computed_d)
 
     def _update_states_after_model_execute(
@@ -1491,10 +1529,9 @@ class GPUModelRunner(
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
-        # TODO: Remove .cpu() sync to enable fully async for hybrid model;
-        # Use num_computed_tokens.gpu instead of req.num_computed_tokens to
-        # support aligned mamba cache mode.
         # Find the number of accepted tokens for each sequence.
+        import time as _ut
+        _ut0 = _ut.perf_counter()
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (
             (
@@ -1514,6 +1551,7 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
+        _ut1 = _ut.perf_counter()
 
         if self.cache_config.mamba_cache_mode == "align":
             for i, num_tokens in enumerate(
@@ -1537,17 +1575,32 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
-            # PC + spec: commit boundary states from spec slots → pool.
+            # PC + spec: defer commit to next step's execute_model
+            # (after sample_complete_event sync) to avoid implicit GPU
+            # sync from .nonzero() stalling the CPU pipeline here.
             if self._pc_spec_layers and self._spec_commit_stash is not None:
                 num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs]
-                bs = self.cache_config.mamba_block_size
-                state_indices_d, num_computed_d = self._spec_commit_stash
-                for layer in self._pc_spec_layers:
-                    layer.commit_boundary_states(
-                        num_accepted_gpu, bs,
-                        state_indices_d, num_computed_d,
-                    )
+                # Stash accepted tokens for deferred commit
+                self._deferred_commit = (
+                    num_accepted_gpu.clone(),
+                    self._spec_commit_stash,
+                )
                 self._spec_commit_stash = None
+            _ut2 = _ut.perf_counter()
+            if not hasattr(self, '_ut_sums'):
+                self._ut_sums = {"accepted": 0, "commit": 0}
+                self._ut_count = 0
+            self._ut_count += 1
+            self._ut_sums["accepted"] += _ut1 - _ut0
+            self._ut_sums["commit"] += _ut2 - _ut1
+            if self._ut_count % 100 == 0:
+                logger.info(
+                    "UPDATE_DETAIL step=%d: accepted=%.2fms commit=%.2fms",
+                    self._ut_count,
+                    self._ut_sums["accepted"] / 100 * 1000,
+                    self._ut_sums["commit"] / 100 * 1000,
+                )
+                self._ut_sums = {k: 0 for k in self._ut_sums}
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -2371,8 +2424,21 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
-        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
-            cm = copy(cm_base)  # shallow copy
+        num_groups = len(kv_cache_groups)
+        for kv_cache_gid in range(num_groups):
+            kv_cache_group = kv_cache_groups[kv_cache_gid]
+            # For the first group, use cm_base directly to avoid a shallow
+            # copy. This is safe: cm_base is not read after this loop, and
+            # subsequent groups copy from cm_base (which retains gid=0's
+            # encoder_seq_lens, but each copy overwrites it immediately).
+            # For subsequent groups, shallow-copy and update the fields
+            # that differ (block_table, slot_mapping, encoder_seq_lens).
+            if kv_cache_gid == 0:
+                cm = cm_base
+            else:
+                cm = copy(cm_base)
+                cm.block_table_tensor = _get_block_table(kv_cache_gid)
+                cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -2382,9 +2448,6 @@ class GPUModelRunner(
                 num_reqs_padded,
                 for_cudagraph_capture=for_cudagraph_capture,
             )
-            if kv_cache_gid > 0:
-                cm.block_table_tensor = _get_block_table(kv_cache_gid)
-                cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
@@ -2705,36 +2768,46 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
 
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
-        )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
-        )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
-        )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
-        )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
-        )
+        # Use pre-allocated CpuGpuBuffers instead of torch.from_numpy().to()
+        # to avoid temporary tensor allocations per step. The numpy arrays are
+        # copied into the pinned CPU buffer, then async-copied to GPU.
+        num_reqs = len(num_draft_tokens)
+        total_sampled = int(cu_num_sampled_tokens[-1])
+        total_draft = int(cu_num_draft_tokens[-1])
+
+        self._sd_cu_num_draft.np[:num_reqs] = cu_num_draft_tokens
+        self._sd_cu_num_draft.copy_to_gpu(num_reqs)
+        cu_num_draft_gpu = self._sd_cu_num_draft.gpu[:num_reqs]
+
+        self._sd_cu_num_sampled.np[:num_reqs] = cu_num_sampled_tokens
+        self._sd_cu_num_sampled.copy_to_gpu(num_reqs)
+        cu_num_sampled_gpu = self._sd_cu_num_sampled.gpu[:num_reqs]
+
+        self._sd_logits_indices.np[:total_sampled] = logits_indices
+        self._sd_logits_indices.copy_to_gpu(total_sampled)
+        logits_indices_gpu = self._sd_logits_indices.gpu[:total_sampled]
+
+        self._sd_target_logits_indices.np[:total_draft] = target_logits_indices
+        self._sd_target_logits_indices.copy_to_gpu(total_draft)
+        target_logits_indices_gpu = self._sd_target_logits_indices.gpu[:total_draft]
+
+        self._sd_bonus_logits_indices.np[:num_reqs] = bonus_logits_indices
+        self._sd_bonus_logits_indices.copy_to_gpu(num_reqs)
+        bonus_logits_indices_gpu = self._sd_bonus_logits_indices.gpu[:num_reqs]
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_ids = self.input_ids.gpu[logits_indices_gpu]
+        draft_token_ids = draft_token_ids[target_logits_indices_gpu + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            cu_num_sampled_tokens=cu_num_sampled_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
+            cu_num_draft_tokens=cu_num_draft_gpu,
+            cu_num_sampled_tokens=cu_num_sampled_gpu,
+            target_logits_indices=target_logits_indices_gpu,
+            bonus_logits_indices=bonus_logits_indices_gpu,
+            logits_indices=logits_indices_gpu,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3893,14 +3966,47 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        import time as _ptime
+        _em_t0 = _ptime.perf_counter()
         # Ensure all GPU work from the previous step (including spec
         # decode side-stream copies) is complete before modifying
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            # PC + spec: execute deferred commit BEFORE _update_states
+            # modifies the batch (condense/remove). The stashed indices
+            # reference the previous step's batch layout.
+            if hasattr(self, '_deferred_commit') and self._deferred_commit is not None:
+                if self.sample_complete_event is not None:
+                    self.sample_complete_event.synchronize()
+                num_accepted_gpu, (state_indices_d, num_computed_d) = self._deferred_commit
+                self._deferred_commit = None
+                bs = self.cache_config.mamba_block_size
+                N = min(state_indices_d.shape[0], num_accepted_gpu.shape[0])
+                n_done = num_computed_d[:N]
+                n_acc = num_accepted_gpu[:N]
+                blk_current = n_done // bs
+                boundary_pos = (blk_current + 1) * bs - 1
+                needs_commit = boundary_pos < (n_done + n_acc)
+                layer0 = self._pc_spec_layers[0]
+                cand_idx = (boundary_pos - n_done).clamp(
+                    min=0, max=layer0.num_spec)
+                base = layer0._spec_base_long[:N]
+                src_slot = base + cand_idx.long()
+                pool_slot = state_indices_d.gather(
+                    1, blk_current.unsqueeze(1).to(torch.int64)
+                ).squeeze(1).long()
+                from vllm.model_executor.layers.mamba.batch_commit_kernel import (
+                    batch_commit_states,
+                )
+                batch_commit_states(
+                    self._pc_spec_layers, src_slot, pool_slot,
+                    needs_commit)
+
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            _em_t_update = _ptime.perf_counter()
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3946,6 +4052,7 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            _em_t_prep = _ptime.perf_counter()
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4068,6 +4175,7 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            _em_t_attn = _ptime.perf_counter()
 
             (
                 input_ids,
@@ -4119,27 +4227,41 @@ class GPUModelRunner(
             ) as kv_connector_output,
         ):
             # Wait for the previous step's sample_tokens() GPU work
-            # (commit_boundary_states, drafter) to complete before
-            # the model forward reads from the mamba state pool.
+            # (drafter) to complete before the model forward reads
+            # from the mamba state pool.
             if self.sample_complete_event is not None:
                 self.sample_complete_event.synchronize()
 
-            # PC + spec: eager init, commit stash, and padding reset
-            # must happen outside cudagraph capture (before _model_forward).
+            # PC + spec: populate per-request mamba spec slots from the
+            # pool in eager mode, before the (potentially captured)
+            # model forward runs. This replaces the old in-forward init
+            # that gated on `if needs_init.any():`, which triggered a
+            # D2H sync that's illegal during cudagraph stream capture
+            # (fatal under FULL_AND_PIECEWISE on H100 + FlashAttn).
+            #
+            # Also clone the metadata that commit_boundary_states needs.
+            # The forward used to stash this via self._spec_pending = (),
+            # but that's a Python side-effect invisible to cudagraph
+            # replay — after the first commit sets it to None, replay
+            # never reassigns it, silently disabling all future commits.
             self._spec_commit_stash = None
             if self._pc_spec_layers:
-                m = self._get_mamba_spec_metadata()
-                if m is not None and m.num_accepted_tokens is not None:
-                    nd = m.num_decodes
-                    for layer in self._pc_spec_layers:
-                        layer.eager_init_spec_slots(m)
-                        # Reset padded positions: under FULL capture the
-                        # kernel writes to all bucket positions including
-                        # padding, corrupting spec slots for cycling reqs.
-                        layer._spec_inited[nd:] = False
-                    if nd > 0:
-                        self._spec_commit_stash = (
-                            self._build_spec_commit_stash(m))
+                # Reset _spec_inited for requests in prefill so their
+                # next FULL decode re-inits from the (correct) post-
+                # prefill pool state instead of stale spec slots.
+                # Also reset num_accepted_tokens to 1 so the kernel
+                # reads from slot 0 (the freshly initialized base).
+                if max_num_scheduled_tokens > self.uniform_decode_query_len:
+                    for req_idx in range(num_reqs):
+                        if num_scheduled_tokens_np[req_idx] > self.uniform_decode_query_len:
+                            for layer in self._pc_spec_layers:
+                                if layer._spec_inited is not None:
+                                    layer._spec_inited[req_idx] = False
+                            self.num_accepted_tokens.gpu[req_idx] = 1
+
+                for layer in self._pc_spec_layers:
+                    layer.eager_init_spec_slots()
+                self._spec_commit_stash = self._build_spec_commit_stash()
 
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -4148,6 +4270,20 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+            _em_t_fwd = _ptime.perf_counter()
+
+            # --- Profiling: wall-clock step timer ---
+            if not hasattr(self, '_prof_step_count'):
+                self._prof_step_count = 0
+                self._prof_step_start = _ptime.perf_counter()
+                self._prof_sums = {"update": 0, "prep": 0, "attn_meta": 0, "other_pre": 0, "fwd": 0}
+            self._prof_step_count += 1
+            self._prof_sums["update"] += _em_t_update - _em_t0
+            self._prof_sums["prep"] += _em_t_prep - _em_t_update
+            self._prof_sums["attn_meta"] += _em_t_attn - _em_t_prep
+            self._prof_sums["other_pre"] += _em_t_fwd - _em_t_attn  # dispatch+slots+preprocess
+            self._prof_sums["fwd"] += _ptime.perf_counter() - _em_t_fwd  # negligible (async)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4267,6 +4403,9 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        import time as _st
+        _st0 = _st.perf_counter()
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -4275,10 +4414,12 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        _st1 = _st.perf_counter()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        _st2 = _st.perf_counter()
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4295,7 +4436,9 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal _st_draft, _st_copy_cpu
             assert spec_decode_common_attn_metadata is not None
+            _d0 = _st.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4308,8 +4451,15 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                _d1 = _st.perf_counter()
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+                _d2 = _st.perf_counter()
+            _st_draft = _d1 - _d0
+            _st_copy_cpu = _d2 - _d1
 
+        _st_draft = 0.0
+        _st_copy_cpu = 0.0
+        _st3 = _st.perf_counter()
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
@@ -4385,6 +4535,7 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        _st4 = _st.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4402,6 +4553,7 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        _st5 = _st.perf_counter()
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4443,6 +4595,45 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
+
+        # --- Profiling: sample_tokens breakdown ---
+        _st6 = _st.perf_counter()
+        if not hasattr(self, '_st_sums'):
+            self._st_sums = {"sample": 0, "update": 0, "spec_logic": 0,
+                             "draft": 0, "copy_cpu": 0, "bookkeep": 0, "output": 0}
+            self._st_count = 0
+        self._st_count += 1
+        self._st_sums["sample"] += _st1 - _st0
+        self._st_sums["update"] += _st2 - _st1
+        self._st_sums["spec_logic"] += _st4 - _st3 - _st_draft - _st_copy_cpu
+        self._st_sums["draft"] += _st_draft
+        self._st_sums["copy_cpu"] += _st_copy_cpu
+        self._st_sums["bookkeep"] += _st5 - _st4
+        self._st_sums["output"] += _st6 - _st5
+        if self._st_count % 100 == 0:
+            parts = " ".join(f"{k}={v/100*1000:.2f}ms" for k, v in self._st_sums.items())
+            total_st = sum(self._st_sums.values()) / 100 * 1000
+            logger.info("SAMPLE_PROFILE step=%d: %s total=%.2fms", self._st_count, parts, total_st)
+            self._st_sums = {k: 0 for k in self._st_sums}
+
+        # --- Profiling: wall-clock log every 100 steps ---
+        if self._prof_step_count % 100 == 0 and self._prof_step_count > 0:
+            import time as _time_mod
+            elapsed = _time_mod.perf_counter() - self._prof_step_start
+            steps_per_sec = 100 / elapsed
+            ms_per_step = elapsed / 100 * 1000
+            parts = " ".join(
+                f"{k}={v/100*1000:.2f}ms" for k, v in self._prof_sums.items()
+            )
+            accounted = sum(self._prof_sums.values()) / 100 * 1000
+            logger.info(
+                "PROFILE step=%d: %.1f steps/s %.1fms/step | "
+                "execute_model: %s (%.1fms) | unaccounted=%.1fms",
+                self._prof_step_count, steps_per_sec, ms_per_step,
+                parts, accounted, ms_per_step - accounted,
+            )
+            self._prof_step_start = _time_mod.perf_counter()
+            self._prof_sums = {k: 0 for k in self._prof_sums}
 
         # Record event after all GPU work in sample_tokens()
         # (commit_boundary_states, drafter, bookkeeping) so the
@@ -6450,6 +6641,7 @@ class GPUModelRunner(
             self.kv_cache_config,
             self.max_num_reqs,
             is_profiling=is_profiling,
+            mamba_cache_mode=self.cache_config.mamba_cache_mode,
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.

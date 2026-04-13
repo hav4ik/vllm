@@ -1254,6 +1254,7 @@ class CompilationConfig:
         kv_cache_config: "KVCacheConfig | None" = None,
         max_num_reqs: int | None = None,
         is_profiling: bool = False,
+        mamba_cache_mode: str = "none",
     ) -> CUDAGraphMode:
         from vllm.v1.attention.backend import AttentionCGSupport
 

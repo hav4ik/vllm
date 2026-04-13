@@ -385,6 +385,23 @@ class NemotronHMTP(nn.Module, SupportsPP):
         )
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without materializing full logits.
+
+        When use_local_argmax_reduction is enabled in the speculative config,
+        the drafter calls this instead of compute_logits().argmax() to avoid
+        all-gathering the full vocab-size logits tensor across TP ranks.
+        For TP=1 this is equivalent but avoids materializing the full
+        [batch, vocab_size] tensor in the common greedy-sampling path.
+        """
+        assert self.lm_head is not None, (
+            "lm_head not initialized - must be shared from target model"
+        )
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load MTP weights with proper name remapping."""
         stacked_params_mapping = [
