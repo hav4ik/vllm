@@ -166,3 +166,63 @@ K=5 wins — the extra position captures enough tokens to offset the drafter cos
 | SGLang v0.5.10.post1 | PC-only (fp8 kv) | 131 |
 
 vLLM is **2.2× faster** than SGLang on NemotronH.
+
+## Updated Throughput Benchmark (vLLM Engine Metrics)
+
+**Methodology**: vLLM's `Avg generation throughput` metric, 3 min per config,
+stats from last 2 min (1 min warmup). AIME-25 hardest 4 problems (12–15),
+`enable_thinking=true`, `max_tokens=65536`. Prometheus-based collection for
+upstream; server log scraping for our fork.
+
+**Branch**: `opt/masked-triton-commit` @ `2564d29b3b`
+
+| Config | p=1 (mean / median) | p=4 (mean / median) | p=8 (mean / median) | Acceptance |
+|--------|---------------------|---------------------|---------------------|------------|
+| **Upstream vLLM 0.19.0 PC-only** | — | — | 1279 / 1277 | — |
+| **Our fork PC-only** | 301 / 301 | 860 / 859 | 1293 / 1294 | — |
+| **K=4 T=0.0** | 370 / 354 | 1262 / 1243 | 1857 / 1860 | 3.33 |
+| **K=4 T=0.7** | 303 / 303 | 976 / 969 | 1542 / 1553 | 2.94 |
+| K=4 T=1.0 | — | — | 1446 / 1465 | 2.75 |
+| **K=7 T=0.0** | 342 / 313 | 1062 / 1055 | 1703 / 1696 | 3.55 |
+| **K=7 T=0.7** | 296 / 296 | 968 / 976 | 1621 / 1550 | 3.48 |
+| K=7 T=1.0 | — | — | 1389 / 1386 | 2.97 |
+
+**Speedup vs upstream PC-only (p=8, mean):**
+
+| Config | tok/s | Speedup |
+|--------|-------|---------|
+| K=4 T=0.0 | 1857 | **+45%** |
+| K=4 T=0.7 | 1542 | **+21%** |
+| K=7 T=0.0 | 1703 | **+33%** |
+| K=7 T=0.7 | 1621 | **+27%** |
+
+## Wheels
+
+Pre-built wheels with cu129 .so files (for Kaggle T4/P100/H100 offline install):
+
+| Wheel | Branch | Commit | Description |
+|-------|--------|--------|-------------|
+| `vllm-0.1.dev7+g2564d29b3.cu129-cp312-cp312-linux_x86_64.whl` | `opt/masked-triton-commit` | `2564d29b` | Baseline (PIECEWISE drafter) |
+| `vllm-0.1.dev8+g5bda034e9.cu129-cp312-cp312-linux_x86_64.whl` | `exp/eagle-prefill-cudagraph` | `5bda034e` | + FULL CUDA graph drafter decode loop |
+
+Located in `/workspace/kaggle-wheels-offline/wheels/`.
+
+Install:
+```bash
+pip install /workspace/kaggle-wheels-offline/wheels/vllm-0.1.dev7+g2564d29b3.cu129-cp312-cp312-linux_x86_64.whl
+```
+
+Server launch:
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model chankhavu/c2-softcpy-fp8 --max-model-len 131072 --trust-remote-code \
+    --mamba-ssm-cache-dtype float16 --max-num-seqs 32 --kv-cache-dtype fp8 \
+    --enable-prefix-caching --mamba-cache-mode all --mamba-block-size 256 \
+    --gpu-memory-utilization 0.85 --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder --download-dir /workspace/models \
+    --host 127.0.0.1 --port 18000 \
+    --speculative-config '{"model":"chankhavu/c2.eagle3-test","method":"eagle3","num_speculative_tokens":5}'
+```
+
+For K=7: change `num_speculative_tokens` to `8`.
+For PC-only: remove the `--speculative-config` line.
