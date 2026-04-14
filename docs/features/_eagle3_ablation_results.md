@@ -21,10 +21,14 @@
 | Eagle3 K=4 T=0.9 | — | 1424 | — |
 | Eagle3 K=4 T=0.8 | — | 1496 | — |
 | Eagle3 K=4 T=0.7 | 349 | 1552 | 1837 |
+| Eagle3 K=5 T=1.0 | — | 1441 | — |
+| Eagle3 K=5 T=0.9 | — | 1439 | — |
+| Eagle3 K=5 T=0.8 | — | 1477 | — |
+| Eagle3 K=5 T=0.7 | — | 1541 | — |
 | Eagle3 K=7 T=1.0 | 325 | 1349 | 1815 |
 | Eagle3 K=7 T=0.7 | 355 | 1458 | 1885 |
 
-## Speedup vs PC-only
+## Speedup vs PC-only (p=8)
 
 | Config | p=1 | p=8 | p=12 |
 |--------|-----|-----|------|
@@ -32,6 +36,10 @@
 | Eagle3 K=4 T=0.9 | — | +20% | — |
 | Eagle3 K=4 T=0.8 | — | +26% | — |
 | Eagle3 K=4 T=0.7 | +15% | +31% | +33% |
+| Eagle3 K=5 T=1.0 | — | +22% | — |
+| Eagle3 K=5 T=0.9 | — | +21% | — |
+| Eagle3 K=5 T=0.8 | — | +25% | — |
+| Eagle3 K=5 T=0.7 | — | +30% | — |
 | Eagle3 K=7 T=1.0 | +7% | +14% | +31% |
 | Eagle3 K=7 T=0.7 | +17% | +23% | +36% |
 
@@ -49,6 +57,28 @@ T=0.8 is a strong middle ground: only 4% less throughput than T=0.7
 best-of-N sampling on hard competition problems. T=0.7-0.8 is the
 recommended range for Kaggle deployment.
 
+## Temperature Sweep (K=5, p=8)
+
+| T | tok/s | vs PC-only | Pos 1 | Pos 2 | Pos 3 | Pos 4 | Pos 5 | Pos 6 | Avg accept |
+|---|-------|------------|-------|-------|-------|-------|-------|-------|------------|
+| 0.7 | **1541** | **+30%** | 74.4% | 53.4% | 37.4% | 27.0% | 19.3% | 14.8% | 37.7% |
+| 0.8 | 1477 | +25% | 71.5% | 50.4% | 35.2% | 24.9% | 18.3% | 13.6% | 35.6% |
+| 0.9 | 1439 | +21% | 71.1% | 47.9% | 33.6% | 23.1% | 16.1% | 11.4% | 33.9% |
+| 1.0 | 1441 | +22% | 67.1% | 45.1% | 30.6% | 21.7% | 14.9% | 10.3% | 31.6% |
+
+## K Comparison (p=8, same temperature)
+
+| T | K=4 | K=5 | K=7 | Best K |
+|---|-----|-----|-----|--------|
+| 0.7 | **1552** | 1541 | 1458 | **K=4** |
+| 0.8 | **1496** | 1477 | — | **K=4** |
+| 0.9 | 1424 | **1439** | — | **K=5** |
+| 1.0 | 1368 | **1441** | 1349 | **K=5** |
+
+At T≤0.8 (high acceptance), K=4 wins — fewer drafter iterations, acceptance
+is high enough that extra positions don't add much. At T≥0.9 (lower acceptance),
+K=5 wins — the extra position captures enough tokens to offset the drafter cost.
+
 ## Per-Position Acceptance Rate
 
 ### K=4 (5 draft positions)
@@ -59,6 +89,15 @@ recommended range for Kaggle deployment.
 | K=4 T=1.0 p=12 | 68.7% | 47.4% | 32.5% | 23.4% | 17.8% | 38.0% |
 | K=4 T=0.7 p=8 | 73.3% | 49.8% | 34.5% | 24.7% | 17.3% | 39.9% |
 | K=4 T=0.7 p=12 | 75.0% | 54.7% | 40.4% | 29.4% | 22.2% | 44.3% |
+
+### K=5 (6 draft positions)
+
+| Config | Pos 1 | Pos 2 | Pos 3 | Pos 4 | Pos 5 | Pos 6 | Avg |
+|--------|-------|-------|-------|-------|-------|-------|-----|
+| K=5 T=1.0 p=8 | 67.1% | 45.1% | 30.6% | 21.7% | 14.9% | 10.3% | 31.6% |
+| K=5 T=0.9 p=8 | 71.1% | 47.9% | 33.6% | 23.1% | 16.1% | 11.4% | 33.9% |
+| K=5 T=0.8 p=8 | 71.5% | 50.4% | 35.2% | 24.9% | 18.3% | 13.6% | 35.6% |
+| K=5 T=0.7 p=8 | 74.4% | 53.4% | 37.4% | 27.0% | 19.3% | 14.8% | 37.7% |
 
 ### K=7 (8 draft positions)
 
@@ -77,10 +116,11 @@ recommended range for Kaggle deployment.
 - T=0.9→1.0 shows little difference in acceptance but throughput drops
 - **Recommended: T=0.8 for competitions** (good throughput + diverse answers)
 
-### K=4 vs K=7
-- K=4 wins at p=8 (1368-1552 vs 1349-1458 tok/s) — drafter overhead dominates
-- K=7 competitive at p=12 (1815-1885 vs 1837-1843 tok/s) — more tokens/step amortizes overhead
-- K=7 positions 6-8 have <15% acceptance — diminishing returns beyond K=5
+### K=4 vs K=5 vs K=7
+- K=4 wins at low temperature (T≤0.8): high acceptance makes extra positions unnecessary
+- K=5 wins at high temperature (T≥0.9): extra position captures enough to offset drafter cost
+- K=7 loses at p=8 across all temperatures — positions 6-8 accept <15%
+- K=7 only competitive at p=12 where more tokens/step amortizes the overhead
 
 ### Parallelism scaling
 - Eagle3 scales better than PC-only with parallelism:
@@ -91,7 +131,8 @@ recommended range for Kaggle deployment.
 ### Recommendation for Kaggle (8 parallel sessions)
 - **Best throughput**: K=4, T=0.7 — **1552 tok/s** (+31% vs PC-only)
 - **Best diversity/throughput tradeoff**: K=4, T=0.8 — **1496 tok/s** (+26% vs PC-only)
-- K=4 preferred over K=7 at p=8 due to lower drafter overhead
+- **For T=1.0 inference**: K=5 — **1441 tok/s** (+22% vs PC-only), beats K=4 (1368)
+- K=4 preferred at T≤0.8, K=5 preferred at T≥0.9
 
 ## Per-step Profiling (K=4, p=1)
 
