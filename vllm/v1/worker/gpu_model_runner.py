@@ -1530,8 +1530,6 @@ class GPUModelRunner(
             return
 
         # Find the number of accepted tokens for each sequence.
-        import time as _ut
-        _ut0 = _ut.perf_counter()
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (
             (
@@ -1551,7 +1549,6 @@ class GPUModelRunner(
             .int()
             .argmax(-1)
         )
-        _ut1 = _ut.perf_counter()
 
         if self.cache_config.mamba_cache_mode == "align":
             for i, num_tokens in enumerate(
@@ -1586,21 +1583,6 @@ class GPUModelRunner(
                     self._spec_commit_stash,
                 )
                 self._spec_commit_stash = None
-            _ut2 = _ut.perf_counter()
-            if not hasattr(self, '_ut_sums'):
-                self._ut_sums = {"accepted": 0, "commit": 0}
-                self._ut_count = 0
-            self._ut_count += 1
-            self._ut_sums["accepted"] += _ut1 - _ut0
-            self._ut_sums["commit"] += _ut2 - _ut1
-            if self._ut_count % 100 == 0:
-                logger.info(
-                    "UPDATE_DETAIL step=%d: accepted=%.2fms commit=%.2fms",
-                    self._ut_count,
-                    self._ut_sums["accepted"] / 100 * 1000,
-                    self._ut_sums["commit"] / 100 * 1000,
-                )
-                self._ut_sums = {k: 0 for k in self._ut_sums}
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -4000,8 +3982,6 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        import time as _ptime
-        _em_t0 = _ptime.perf_counter()
         # Ensure all GPU work from the previous step (including spec
         # decode side-stream copies) is complete before modifying
         with (
@@ -4042,7 +4022,7 @@ class GPUModelRunner(
 
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
-            _em_t_update = _ptime.perf_counter()
+
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4088,7 +4068,7 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
-            _em_t_prep = _ptime.perf_counter()
+
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4211,7 +4191,7 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
-            _em_t_attn = _ptime.perf_counter()
+
 
             (
                 input_ids,
@@ -4306,20 +4286,6 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
-
-            _em_t_fwd = _ptime.perf_counter()
-
-            # --- Profiling: wall-clock step timer ---
-            if not hasattr(self, '_prof_step_count'):
-                self._prof_step_count = 0
-                self._prof_step_start = _ptime.perf_counter()
-                self._prof_sums = {"update": 0, "prep": 0, "attn_meta": 0, "other_pre": 0, "fwd": 0}
-            self._prof_step_count += 1
-            self._prof_sums["update"] += _em_t_update - _em_t0
-            self._prof_sums["prep"] += _em_t_prep - _em_t_update
-            self._prof_sums["attn_meta"] += _em_t_attn - _em_t_prep
-            self._prof_sums["other_pre"] += _em_t_fwd - _em_t_attn  # dispatch+slots+preprocess
-            self._prof_sums["fwd"] += _ptime.perf_counter() - _em_t_fwd  # negligible (async)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4439,9 +4405,6 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        import time as _st
-        _st0 = _st.perf_counter()
-
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -4450,12 +4413,10 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-        _st1 = _st.perf_counter()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
-        _st2 = _st.perf_counter()
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4472,9 +4433,7 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
-            nonlocal _st_draft, _st_copy_cpu
             assert spec_decode_common_attn_metadata is not None
-            _d0 = _st.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4487,15 +4446,8 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                _d1 = _st.perf_counter()
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
-                _d2 = _st.perf_counter()
-            _st_draft = _d1 - _d0
-            _st_copy_cpu = _d2 - _d1
 
-        _st_draft = 0.0
-        _st_copy_cpu = 0.0
-        _st3 = _st.perf_counter()
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
@@ -4571,7 +4523,6 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        _st4 = _st.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4589,7 +4540,6 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
-        _st5 = _st.perf_counter()
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4631,45 +4581,6 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
             )
 
-
-        # --- Profiling: sample_tokens breakdown ---
-        _st6 = _st.perf_counter()
-        if not hasattr(self, '_st_sums'):
-            self._st_sums = {"sample": 0, "update": 0, "spec_logic": 0,
-                             "draft": 0, "copy_cpu": 0, "bookkeep": 0, "output": 0}
-            self._st_count = 0
-        self._st_count += 1
-        self._st_sums["sample"] += _st1 - _st0
-        self._st_sums["update"] += _st2 - _st1
-        self._st_sums["spec_logic"] += _st4 - _st3 - _st_draft - _st_copy_cpu
-        self._st_sums["draft"] += _st_draft
-        self._st_sums["copy_cpu"] += _st_copy_cpu
-        self._st_sums["bookkeep"] += _st5 - _st4
-        self._st_sums["output"] += _st6 - _st5
-        if self._st_count % 100 == 0:
-            parts = " ".join(f"{k}={v/100*1000:.2f}ms" for k, v in self._st_sums.items())
-            total_st = sum(self._st_sums.values()) / 100 * 1000
-            logger.info("SAMPLE_PROFILE step=%d: %s total=%.2fms", self._st_count, parts, total_st)
-            self._st_sums = {k: 0 for k in self._st_sums}
-
-        # --- Profiling: wall-clock log every 100 steps ---
-        if self._prof_step_count % 100 == 0 and self._prof_step_count > 0:
-            import time as _time_mod
-            elapsed = _time_mod.perf_counter() - self._prof_step_start
-            steps_per_sec = 100 / elapsed
-            ms_per_step = elapsed / 100 * 1000
-            parts = " ".join(
-                f"{k}={v/100*1000:.2f}ms" for k, v in self._prof_sums.items()
-            )
-            accounted = sum(self._prof_sums.values()) / 100 * 1000
-            logger.info(
-                "PROFILE step=%d: %.1f steps/s %.1fms/step | "
-                "execute_model: %s (%.1fms) | unaccounted=%.1fms",
-                self._prof_step_count, steps_per_sec, ms_per_step,
-                parts, accounted, ms_per_step - accounted,
-            )
-            self._prof_step_start = _time_mod.perf_counter()
-            self._prof_sums = {k: 0 for k in self._prof_sums}
 
         # Record event after all GPU work in sample_tokens()
         # (commit_boundary_states, drafter, bookkeeping) so the

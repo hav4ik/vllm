@@ -560,8 +560,6 @@ class SpecDecodeBaseProposer:
         # update max_seq_len for subsequent iterations. The tensor fields
         # (seq_lens, slot_mapping) are updated in-place by the CUDA kernel.
         _cached_group_metadata = None
-        import time as _t
-        _prof_times = {"update": 0, "metadata": 0, "copy": 0, "ctx_fwd": 0, "sample": 0}
 
         # Pre-allocate model_kwargs dict once; update in-place each iteration
         # to avoid dict creation overhead (~5us per iteration).
@@ -601,10 +599,6 @@ class SpecDecodeBaseProposer:
         _fwd_ctx_module._forward_context = _drafter_fwd_ctx
         try:
           for token_index in range(self.num_speculative_tokens - 1):
-            _t0 = _t.perf_counter()
-            # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_list[-1].int()
             # Use fused kernel for slot mapping and metadata updates.
             # Write clamped positions directly into the positions buffer to
@@ -653,9 +647,6 @@ class SpecDecodeBaseProposer:
             if common_attn_metadata._num_computed_tokens_cpu is not None:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
-            _t1 = _t.perf_counter()
-            _prof_times["update"] += _t1 - _t0
-
             # First iteration: build metadata (slot_mapping now points to
             # drafter buffer). Subsequent iterations: just update max_seq_len.
             if _cached_group_metadata is None:
@@ -679,9 +670,6 @@ class SpecDecodeBaseProposer:
                 input_batch_size
             )
 
-            _t2 = _t.perf_counter()
-            _prof_times["metadata"] += _t2 - _t1
-
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self.hidden_states[:batch_size] = hidden_states
@@ -696,9 +684,6 @@ class SpecDecodeBaseProposer:
             if self.pass_hidden_states_to_model:
                 _model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
-            _t3 = _t.perf_counter()
-            _prof_times["copy"] = _prof_times.get("copy", 0) + _t3 - _t2
-
             # Run the model directly -- forward context already set above.
             ret_hidden_states = self.model(**_model_kwargs)
             if not self.model_returns_tuple():
@@ -707,31 +692,11 @@ class SpecDecodeBaseProposer:
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
-            _t4 = _t.perf_counter()
-            _prof_times["ctx_fwd"] = _prof_times.get("ctx_fwd", 0) + _t4 - _t3
-
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
             draft_token_ids_list.append(draft_token_ids)
-            _t5 = _t.perf_counter()
-            _prof_times["sample"] += _t5 - _t4
         finally:
           _fwd_ctx_module._forward_context = _prev_fwd_ctx
-
-        # Log drafter loop profiling every 50 calls
-        if not hasattr(self, '_prof_call_count'):
-            self._prof_call_count = 0
-            self._prof_accum = {k: 0.0 for k in _prof_times}
-        self._prof_call_count += 1
-        for k, v in _prof_times.items():
-            self._prof_accum[k] = self._prof_accum.get(k, 0.0) + v
-        if self._prof_call_count % 50 == 0:
-            parts = " ".join(f"{k}={self._prof_accum[k]/50*1000:.2f}ms"
-                             for k in ["update", "metadata", "copy", "ctx_fwd", "sample"])
-            total = sum(self._prof_accum.values()) / 50 * 1000
-            logger.info("DRAFTER_PROFILE calls=%d (per-call avg, %d iters): %s total=%.2fms",
-                        self._prof_call_count, self.num_speculative_tokens - 1, parts, total)
-            self._prof_accum = {k: 0.0 for k in self._prof_accum}
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
