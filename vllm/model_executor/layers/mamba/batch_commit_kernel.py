@@ -47,11 +47,25 @@ def _cache(layers, dev):
     logger.info("batch_commit: %d layers, SSM=%d bytes", len(layers), s0[0].numel()*s0.element_size())
     return _c
 
-def batch_commit_states(layers, src_slot, pool_slot, needs_commit):
+def batch_commit_states(layers, src_slot, pool_slot, needs_commit,
+                        src_slot_conv=None):
+    """Commit spec slot states to the pool for boundary blocks.
+
+    Args:
+        src_slot: Source spec slot for SSM state (base + cand_idx).
+        pool_slot: Destination pool slot.
+        needs_commit: Boolean mask of requests needing commit.
+        src_slot_conv: Source spec slot for conv state. Defaults to
+            src_slot. Should be set to base (slot 0) because the conv
+            kernel only writes rolling-window state to the base slot;
+            other spec slots contain stale/zero conv data.
+    """
     N = needs_commit.shape[0]
     if N == 0: return
+    if src_slot_conv is None:
+        src_slot_conv = src_slot
     c = _cache(layers, needs_commit.device)
     mask = needs_commit.to(torch.int8).contiguous()
     g = (len(layers), N)
     _batch_commit_kernel[g](c['ss'],c['sd'],src_slot,pool_slot,mask,c['sss'],c['sds'],c['sn'],BLOCK_SIZE=c['sb'])
-    _batch_commit_kernel[g](c['cs'],c['cd'],src_slot,pool_slot,mask,c['css'],c['cds'],c['cn'],BLOCK_SIZE=c['cb'])
+    _batch_commit_kernel[g](c['cs'],c['cd'],src_slot_conv,pool_slot,mask,c['css'],c['cds'],c['cn'],BLOCK_SIZE=c['cb'])

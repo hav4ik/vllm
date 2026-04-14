@@ -4080,7 +4080,7 @@ class GPUModelRunner(
                 )
                 batch_commit_states(
                     self._pc_spec_layers, src_slot, pool_slot,
-                    needs_commit)
+                    needs_commit, src_slot_conv=base)
 
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
@@ -4324,18 +4324,18 @@ class GPUModelRunner(
             # never reassigns it, silently disabling all future commits.
             self._spec_commit_stash = None
             if self._pc_spec_layers:
-                # Reset _spec_inited for requests in prefill so their
-                # next FULL decode re-inits from the (correct) post-
-                # prefill pool state instead of stale spec slots.
-                # Also reset num_accepted_tokens to 1 so the kernel
-                # reads from slot 0 (the freshly initialized base).
+                # In a mixed batch (prefill + decode), ALL requests go
+                # through the non-spec pool path. Reset _spec_inited for
+                # all of them so the next spec-decode step re-initializes
+                # from the (correct) post-forward pool state instead of
+                # stale spec slots. Also reset num_accepted_tokens to 1
+                # so the kernel reads from slot 0 (freshly initialized).
                 if max_num_scheduled_tokens > self.uniform_decode_query_len:
                     for req_idx in range(num_reqs):
-                        if num_scheduled_tokens_np[req_idx] > self.uniform_decode_query_len:
-                            for layer in self._pc_spec_layers:
-                                if layer._spec_inited is not None:
-                                    layer._spec_inited[req_idx] = False
-                            self.num_accepted_tokens.gpu[req_idx] = 1
+                        for layer in self._pc_spec_layers:
+                            if layer._spec_inited is not None:
+                                layer._spec_inited[req_idx] = False
+                        self.num_accepted_tokens.gpu[req_idx] = 1
 
                 for layer in self._pc_spec_layers:
                     layer.eager_init_spec_slots()
