@@ -18,6 +18,8 @@
 |--------|-----|-----|------|
 | **PC-only (no Eagle3)** | **303** | **1186** | **1383** |
 | Eagle3 K=4 T=1.0 | 298 | 1368 | 1843 |
+| Eagle3 K=4 T=0.9 | — | 1424 | — |
+| Eagle3 K=4 T=0.8 | — | 1496 | — |
 | Eagle3 K=4 T=0.7 | 349 | 1552 | 1837 |
 | Eagle3 K=7 T=1.0 | 325 | 1349 | 1815 |
 | Eagle3 K=7 T=0.7 | 355 | 1458 | 1885 |
@@ -26,10 +28,26 @@
 
 | Config | p=1 | p=8 | p=12 |
 |--------|-----|-----|------|
-| Eagle3 K=4 T=1.0 | -2% | **+15%** | **+33%** |
-| Eagle3 K=4 T=0.7 | +15% | **+31%** | **+33%** |
-| Eagle3 K=7 T=1.0 | +7% | +14% | **+31%** |
-| Eagle3 K=7 T=0.7 | +17% | **+23%** | **+36%** |
+| Eagle3 K=4 T=1.0 | -2% | +15% | +33% |
+| Eagle3 K=4 T=0.9 | — | +20% | — |
+| Eagle3 K=4 T=0.8 | — | +26% | — |
+| Eagle3 K=4 T=0.7 | +15% | +31% | +33% |
+| Eagle3 K=7 T=1.0 | +7% | +14% | +31% |
+| Eagle3 K=7 T=0.7 | +17% | +23% | +36% |
+
+## Temperature Sweep (K=4, p=8)
+
+| T | tok/s | vs PC-only | Pos 1 | Pos 2 | Pos 3 | Pos 4 | Pos 5 | Avg accept |
+|---|-------|------------|-------|-------|-------|-------|-------|------------|
+| 0.7 | **1552** | **+31%** | 73.3% | 49.8% | 34.5% | 24.7% | 17.3% | 39.9% |
+| 0.8 | 1496 | +26% | 73.8% | 51.8% | 35.8% | 25.1% | 18.1% | 40.9% |
+| 0.9 | 1424 | +20% | 69.3% | 47.1% | 31.9% | 22.9% | 16.4% | 37.5% |
+| 1.0 | 1368 | +15% | 69.2% | 47.5% | 33.5% | 23.6% | 17.1% | 38.2% |
+
+T=0.8 is a strong middle ground: only 4% less throughput than T=0.7
+(1496 vs 1552) while preserving more output diversity — important for
+best-of-N sampling on hard competition problems. T=0.7-0.8 is the
+recommended range for Kaggle deployment.
 
 ## Per-Position Acceptance Rate
 
@@ -54,9 +72,10 @@
 ## Analysis
 
 ### Temperature effect
-- T=0.7 consistently improves acceptance rate by 2-6 percentage points across all positions
-- Throughput improvement: +10-17% at p=1, +13-23% at p=8
-- The target distribution is sharper at lower temperature, making drafter predictions easier
+- T=0.7→0.8 is a small throughput gap (~4%) with better output diversity
+- T=0.8→0.9 is a larger gap (~5%) — the sweet spot boundary
+- T=0.9→1.0 shows little difference in acceptance but throughput drops
+- **Recommended: T=0.8 for competitions** (good throughput + diverse answers)
 
 ### K=4 vs K=7
 - K=4 wins at p=8 (1368-1552 vs 1349-1458 tok/s) — drafter overhead dominates
@@ -66,13 +85,13 @@
 ### Parallelism scaling
 - Eagle3 scales better than PC-only with parallelism:
   - PC-only p=8→p=12: +17% (1186→1383)
-  - Eagle3 K=4 T=0.7 p=8→p=12: +18% (1552→1837)
-- At p=12, Eagle3 K=4 T=0.7 is **33% faster** than PC-only
+  - Eagle3 K=4 T=1.0 p=8→p=12: +35% (1368→1843)
+- At p=12, all Eagle3 configs beat PC-only by 31-36%
 
 ### Recommendation for Kaggle (8 parallel sessions)
-- **Best config**: K=4, T=0.7 — **1552 tok/s** (+31% vs PC-only 1186)
-- Alternative: K=7, T=0.7 — 1458 tok/s (+23% vs PC-only)
-- K=4 preferred over K=7 due to lower drafter overhead and similar throughput
+- **Best throughput**: K=4, T=0.7 — **1552 tok/s** (+31% vs PC-only)
+- **Best diversity/throughput tradeoff**: K=4, T=0.8 — **1496 tok/s** (+26% vs PC-only)
+- K=4 preferred over K=7 at p=8 due to lower drafter overhead
 
 ## Per-step Profiling (K=4, p=1)
 
