@@ -6408,6 +6408,51 @@ class GPUModelRunner(
             if self.encoder_cudagraph_manager is not None:
                 self.encoder_cudagraph_manager.capture()
 
+            # Capture drafter decode loop FULL graphs
+            if (
+                hasattr(self, 'drafter')
+                and isinstance(self.drafter, EagleProposer)
+                and self.drafter.num_speculative_tokens > 1
+            ):
+                # Build a template CommonAttentionMetadata for the drafter
+                # to use during graph capture. We need a valid block_table
+                # tensor reference (the drafter reads from the target's
+                # block tables).
+                from vllm.v1.attention.backend import (
+                    CommonAttentionMetadata,
+                )
+                _bt_gid = self.drafter.kv_cache_gid
+                _bt = self.input_batch.block_table
+                if hasattr(_bt, 'block_tables'):
+                    _dummy_bt = _bt.block_tables[_bt_gid].get_device_tensor(
+                        self.scheduler_config.max_num_seqs
+                    )
+                else:
+                    _dummy_bt = _bt[_bt_gid].get_device_tensor(
+                        self.scheduler_config.max_num_seqs
+                    )
+                _dummy_cad = CommonAttentionMetadata(
+                    query_start_loc=torch.zeros(
+                        2, dtype=torch.int32, device=self.device
+                    ),
+                    query_start_loc_cpu=torch.zeros(
+                        2, dtype=torch.int32
+                    ),
+                    seq_lens=torch.ones(
+                        1, dtype=torch.int32, device=self.device
+                    ),
+                    max_seq_len=self.max_model_len,
+                    num_reqs=1,
+                    num_actual_tokens=1,
+                    max_query_len=1,
+                    block_table_tensor=_dummy_bt,
+                    slot_mapping=torch.zeros(
+                        1, dtype=torch.int64, device=self.device
+                    ),
+                    causal=True,
+                )
+                self.drafter.capture_decode_graphs(_dummy_cad)
+
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
 

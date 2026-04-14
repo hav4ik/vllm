@@ -406,6 +406,202 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    # ------------------------------------------------------------------
+    # FULL CUDA graph for the drafter decode loop
+    # ------------------------------------------------------------------
+    def _init_decode_graph_buffers(self) -> None:
+        """Pre-allocate persistent output buffers for the graphed decode loop."""
+        if hasattr(self, '_cg_draft_ids'):
+            return
+        self._cg_draft_ids = torch.zeros(
+            self.max_batch_size, self.num_speculative_tokens,
+            dtype=torch.int64, device=self.device,
+        )
+        self._cg_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._cg_pool = torch.cuda.graph_pool_handle()
+        # Cache the forward context per padded size to avoid re-creation
+        self._cg_fwd_ctxs: dict[int, object] = {}
+
+    def _make_decode_loop_fn(
+        self,
+        batch_size: int,
+        input_batch_size: int,
+        block_table_tensor: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_size: int,
+    ):
+        """Build a closure that runs the GPU-only decode loop."""
+        model = self.model
+        model_returns_tuple = self.model_returns_tuple()
+        pass_hidden = self.pass_hidden_states_to_model
+        num_iters = self.num_speculative_tokens - 1
+        max_model_len = self.max_model_len
+
+        # Persistent buffer views (addresses fixed across replays)
+        input_ids_buf = self.input_ids[:input_batch_size]
+        positions_buf = self._get_positions(input_batch_size)
+        hidden_buf = self.hidden_states[:input_batch_size]
+        slot_buf = self._slot_mapping_buffer[:input_batch_size]
+        pos_buf = self.positions[:batch_size]
+        draft_ids = self._cg_draft_ids
+
+        model_kwargs: dict = {
+            "input_ids": input_ids_buf,
+            "positions": positions_buf,
+            "inputs_embeds": None,
+        }
+        if pass_hidden:
+            model_kwargs["hidden_states"] = hidden_buf
+
+        def _loop():
+            for step in range(num_iters):
+                ret = model(**model_kwargs)
+                if not model_returns_tuple:
+                    last_h = ret
+                    new_h = ret
+                else:
+                    last_h, new_h = ret
+
+                draft_ids[:batch_size, step + 1] = (
+                    model.compute_logits(last_h[:batch_size]).argmax(dim=-1)
+                )
+
+                if step < num_iters - 1:
+                    self.input_ids[:batch_size] = (
+                        draft_ids[:batch_size, step + 1].int()
+                    )
+                    self.hidden_states[:batch_size] = new_h[:batch_size]
+                    eagle_step_update_slot_mapping_and_metadata(
+                        positions_1d=pos_buf,
+                        block_table_tensor=block_table_tensor,
+                        seq_lens=seq_lens,
+                        block_size=block_size,
+                        max_model_len=max_model_len,
+                        out_clamped_positions=pos_buf,
+                        out_slot_mapping=slot_buf,
+                        input_batch_size=input_batch_size,
+                    )
+
+        return _loop
+
+    def capture_decode_graphs(
+        self,
+        common_attn_metadata_template: 'CommonAttentionMetadata',
+    ) -> None:
+        """Capture FULL CUDA graphs for the drafter decode loop.
+
+        Called during model startup inside the graph_capture() context,
+        after the main model graphs are captured.
+        """
+        if self.num_speculative_tokens <= 1:
+            return
+        if self.uses_mrope or (
+            self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0
+        ):
+            logger.info("Skipping drafter decode graph capture (M-RoPE/xDRoPE)")
+            return
+
+        self._init_decode_graph_buffers()
+
+        # Determine which batch sizes to capture
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        if not capture_sizes:
+            return
+
+        max_batch = self.max_batch_size
+        # Filter to valid drafter batch sizes
+        batch_sizes_to_capture = sorted(set(
+            s for s in capture_sizes if s <= max_batch
+        ))
+
+        logger.info(
+            "Capturing drafter decode loop graphs for %d batch sizes "
+            "(%d iterations each)...",
+            len(batch_sizes_to_capture),
+            self.num_speculative_tokens - 1,
+        )
+
+        block_size = self.block_size
+        assert block_size > 0
+
+        for padded_bs in batch_sizes_to_capture:
+            batch_size = padded_bs
+            input_batch_size = padded_bs
+
+            # Build dummy attention metadata with max_seq_len=max_model_len
+            # so FA3 pre-allocates large enough intermediate buffers.
+            dummy_seq_lens = torch.ones(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+            dummy_query_start_loc = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            dummy_block_table = (
+                common_attn_metadata_template.block_table_tensor[
+                    :batch_size
+                ]
+            )
+            dummy_slot_mapping = self._slot_mapping_buffer[:batch_size]
+
+            from vllm.v1.attention.backend import CommonAttentionMetadata
+            dummy_cad = CommonAttentionMetadata(
+                query_start_loc=dummy_query_start_loc,
+                query_start_loc_cpu=torch.arange(
+                    batch_size + 1, dtype=torch.int32
+                ),
+                seq_lens=dummy_seq_lens,
+                max_seq_len=self.max_model_len,
+                num_reqs=batch_size,
+                num_actual_tokens=batch_size,
+                max_query_len=1,
+                block_table_tensor=dummy_block_table,
+                slot_mapping=dummy_slot_mapping,
+                causal=True,
+            )
+
+            _, per_layer_metadata = (
+                self.build_per_group_and_layer_attn_metadata(
+                    dummy_cad, draft_index=1
+                )
+            )
+
+            # Create forward context for this batch size
+            fwd_ctx = create_forward_context(
+                attn_metadata=per_layer_metadata,
+                vllm_config=self.vllm_config,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=input_batch_size
+                ),
+                slot_mapping=self._get_slot_mapping(input_batch_size),
+            )
+            self._cg_fwd_ctxs[input_batch_size] = fwd_ctx
+
+            # Build the decode loop function
+            loop_fn = self._make_decode_loop_fn(
+                batch_size, input_batch_size,
+                dummy_block_table, dummy_seq_lens, block_size,
+            )
+
+            import vllm.forward_context as _fwd_mod
+            _prev = _fwd_mod._forward_context
+            _fwd_mod._forward_context = fwd_ctx
+            try:
+                # Warmup
+                loop_fn()
+                # Capture
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self._cg_pool):
+                    loop_fn()
+                self._cg_graphs[input_batch_size] = graph
+            finally:
+                _fwd_mod._forward_context = _prev
+
+        logger.info(
+            "Captured %d drafter decode loop graphs",
+            len(self._cg_graphs),
+        )
+
     def propose(
         self,
         # [num_tokens]
@@ -554,184 +750,285 @@ class SpecDecodeBaseProposer:
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
 
-        # Reuse attention metadata across drafter iterations instead of
-        # rebuilding from scratch each time. Build on the first iteration
-        # (after slot_mapping is set to the drafter buffer), then only
-        # update max_seq_len for subsequent iterations. The tensor fields
-        # (seq_lens, slot_mapping) are updated in-place by the CUDA kernel.
-        _cached_group_metadata = None
         import time as _t
-        _prof_times = {"update": 0, "metadata": 0, "copy": 0, "ctx_fwd": 0, "sample": 0}
 
-        # Pre-allocate model_kwargs dict once; update in-place each iteration
-        # to avoid dict creation overhead (~5us per iteration).
-        _model_kwargs = {
-            "input_ids": None,
-            "positions": None,
-            "inputs_embeds": None,
-        }
-        if self.pass_hidden_states_to_model:
-            _model_kwargs["hidden_states"] = None
-
-        # Create the forward context once before the loop and mutate its
-        # attn_metadata and slot_mapping fields per iteration, avoiding
-        # the overhead of set_forward_context's context manager machinery
-        # (DPMetadata creation, ForwardContext allocation, kernel_config
-        # priority context entry) on every iteration.
-        _drafter_fwd_ctx = create_forward_context(
-            attn_metadata=None,  # set on first iteration
-            vllm_config=self.vllm_config,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            batch_descriptor=BatchDescriptor(num_tokens=input_batch_size),
-            slot_mapping=self._get_slot_mapping(input_batch_size),
+        # --- Try FULL CUDA graph replay for the decode loop ---
+        _use_cg = (
+            hasattr(self, '_cg_graphs')
+            and input_batch_size in self._cg_graphs
+            and not self.uses_mrope
+            and not (self.uses_xdrope_dim > 0
+                     and self.draft_uses_xdrope_dim > 0)
+            and not self.supports_mm_inputs
         )
-        if (
-            self.vllm_config.parallel_config.data_parallel_size > 1
-            and self.vllm_config.parallel_config.is_moe_model is not False
-        ):
-            from vllm.forward_context import DPMetadata
-            _drafter_fwd_ctx.dp_metadata = DPMetadata.make(
-                self.vllm_config.parallel_config,
-                input_batch_size,
-                batch_size_across_dp,
-            )
 
-        import vllm.forward_context as _fwd_ctx_module
-        _prev_fwd_ctx = _fwd_ctx_module._forward_context
-        _fwd_ctx_module._forward_context = _drafter_fwd_ctx
-        try:
-          for token_index in range(self.num_speculative_tokens - 1):
-            _t0 = _t.perf_counter()
-            # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
-            # Use fused kernel for slot mapping and metadata updates.
-            # Write clamped positions directly into the positions buffer to
-            # avoid an extra D2D copy for the common (non-mrope) case.
-            positions_1d = positions[0] if self.uses_mrope else positions
-            if self.uses_mrope:
-                out_pos = self.mrope_positions[0, :batch_size]
-            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-                out_pos = self.xdrope_positions[0, :batch_size]
-            else:
-                out_pos = self.positions[:batch_size]
+        if _use_cg:
+            _t_cg0 = _t.perf_counter()
+
+            # Pre-run the first slot update to set slot_mapping to
+            # the drafter buffer and advance positions/seq_lens by 1
             eagle_step_update_slot_mapping_and_metadata(
-                positions_1d=positions_1d,
+                positions_1d=positions,
                 block_table_tensor=common_attn_metadata.block_table_tensor,
                 seq_lens=common_attn_metadata.seq_lens,
                 block_size=block_size,
                 max_model_len=self.max_model_len,
-                out_clamped_positions=out_pos,
-                out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+                out_clamped_positions=self.positions[:batch_size],
+                out_slot_mapping=self._slot_mapping_buffer[
+                    :input_batch_size
+                ],
                 input_batch_size=input_batch_size,
             )
-            common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
-            if self.uses_mrope:
-                self.mrope_positions[1:, :batch_size] = self.mrope_positions[
-                    0, :batch_size
-                ]
-                positions = self.mrope_positions[:, :batch_size]
-            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-                self.xdrope_positions[1:, :batch_size] = self.xdrope_positions[
-                    0, :batch_size
-                ]
-                positions = self.xdrope_positions[0, :batch_size]
-            else:
-                positions = self.positions[:batch_size]
-            # Increment the maximum sequence length. We increment max_seq_len
-            # unconditionally even though some seq_lens may have been capped above,
-            # as max_seq_len serves as an upper bound for sequence lengths.
-            common_attn_metadata.max_seq_len = min(
-                common_attn_metadata.max_seq_len + 1, self.max_model_len
+            common_attn_metadata.slot_mapping = (
+                self._slot_mapping_buffer[:batch_size]
+            )
+            # Use max_model_len so the baked-in max_seqlen_k covers all
+            # possible future seq_lens. FA3 intermediate buffers were
+            # pre-allocated during capture_decode_graphs().
+            common_attn_metadata.max_seq_len = self.max_model_len
+
+            # Rebuild attention metadata to update the FA3 scheduler
+            # persistent buffer with current seq_lens.
+            _, per_layer_metadata = (
+                self.build_per_group_and_layer_attn_metadata(
+                    common_attn_metadata, draft_index=1
+                )
             )
 
-            # Also update the CPU-side shadow; NOTE: this is hacky and should be
-            # removed in when common_attn_metadata.seq_lens_cpu is deprecated.
-            if common_attn_metadata._seq_lens_cpu is not None:
-                common_attn_metadata._seq_lens_cpu += 1
-            if common_attn_metadata._num_computed_tokens_cpu is not None:
-                common_attn_metadata._num_computed_tokens_cpu += 1
-
-            _t1 = _t.perf_counter()
-            _prof_times["update"] += _t1 - _t0
-
-            # First iteration: build metadata (slot_mapping now points to
-            # drafter buffer). Subsequent iterations: just update max_seq_len.
-            if _cached_group_metadata is None:
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=token_index + 1
-                    )
-                )
-                # Collect unique metadata objects for fast update
-                _cached_group_metadata = list({
-                    id(md): md
-                    for md in per_layer_attn_metadata.values()
-                }.values())
-            else:
-                for md in _cached_group_metadata:
-                    md.max_seq_len = common_attn_metadata.max_seq_len
-
-            # Mutate the forward context in-place instead of re-creating
-            _drafter_fwd_ctx.attn_metadata = per_layer_attn_metadata
-            _drafter_fwd_ctx.slot_mapping = self._get_slot_mapping(
+            # Set forward context and copy inputs
+            fwd_ctx = self._cg_fwd_ctxs[input_batch_size]
+            fwd_ctx.attn_metadata = per_layer_metadata
+            fwd_ctx.slot_mapping = self._get_slot_mapping(
                 input_batch_size
             )
 
-            _t2 = _t.perf_counter()
-            _prof_times["metadata"] += _t2 - _t1
-
-            # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
+            self.input_ids[:batch_size] = draft_token_ids.int()
             self.hidden_states[:batch_size] = hidden_states
-            if self.supports_mm_inputs:
-                self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
-                _model_kwargs["input_ids"] = None
-                _model_kwargs["inputs_embeds"] = self.inputs_embeds[:input_batch_size]
-            else:
-                _model_kwargs["input_ids"] = self.input_ids[:input_batch_size]
-                _model_kwargs["inputs_embeds"] = None
-            _model_kwargs["positions"] = self._get_positions(input_batch_size)
+            self._cg_draft_ids[:batch_size, 0] = draft_token_ids
+
+            import vllm.forward_context as _fwd_ctx_module
+            _prev_fwd_ctx = _fwd_ctx_module._forward_context
+            _fwd_ctx_module._forward_context = fwd_ctx
+
+            # Replay the captured graph
+            self._cg_graphs[input_batch_size].replay()
+
+            _fwd_ctx_module._forward_context = _prev_fwd_ctx
+
+            draft_token_ids_list = [
+                self._cg_draft_ids[:batch_size, i]
+                for i in range(self.num_speculative_tokens)
+            ]
+
+            _t_cg1 = _t.perf_counter()
+
+            # Profiling
+            if not hasattr(self, '_prof_call_count'):
+                self._prof_call_count = 0
+                self._prof_accum = {"decode_cg": 0}
+            self._prof_call_count += 1
+            self._prof_accum["decode_cg"] += _t_cg1 - _t_cg0
+            if self._prof_call_count % 50 == 0:
+                avg = self._prof_accum["decode_cg"] / 50 * 1000
+                logger.info(
+                    "DRAFTER_PROFILE calls=%d: decode_cg=%.2fms "
+                    "batch=%d (FULL graph)",
+                    self._prof_call_count, avg, batch_size,
+                )
+                self._prof_accum = {"decode_cg": 0}
+
+        else:
+            # --- Fallback: PIECEWISE per-iteration loop ---
+            _cached_group_metadata = None
+            _prof_times = {"update": 0, "metadata": 0, "copy": 0,
+                           "ctx_fwd": 0, "sample": 0}
+
+            _model_kwargs = {
+                "input_ids": None,
+                "positions": None,
+                "inputs_embeds": None,
+            }
             if self.pass_hidden_states_to_model:
-                _model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+                _model_kwargs["hidden_states"] = None
 
-            _t3 = _t.perf_counter()
-            _prof_times["copy"] = _prof_times.get("copy", 0) + _t3 - _t2
+            _drafter_fwd_ctx = create_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=input_batch_size
+                ),
+                slot_mapping=self._get_slot_mapping(input_batch_size),
+            )
+            if (
+                self.vllm_config.parallel_config.data_parallel_size > 1
+                and self.vllm_config.parallel_config.is_moe_model
+                is not False
+            ):
+                from vllm.forward_context import DPMetadata
+                _drafter_fwd_ctx.dp_metadata = DPMetadata.make(
+                    self.vllm_config.parallel_config,
+                    input_batch_size,
+                    batch_size_across_dp,
+                )
 
-            # Run the model directly -- forward context already set above.
-            ret_hidden_states = self.model(**_model_kwargs)
-            if not self.model_returns_tuple():
-                last_hidden_states = ret_hidden_states
-                hidden_states = ret_hidden_states
-            else:
-                last_hidden_states, hidden_states = ret_hidden_states
+            import vllm.forward_context as _fwd_ctx_module
+            _prev_fwd_ctx = _fwd_ctx_module._forward_context
+            _fwd_ctx_module._forward_context = _drafter_fwd_ctx
+            try:
+              for token_index in range(
+                  self.num_speculative_tokens - 1
+              ):
+                _t0 = _t.perf_counter()
+                input_ids = draft_token_ids_list[-1].int()
+                positions_1d = (
+                    positions[0] if self.uses_mrope else positions
+                )
+                if self.uses_mrope:
+                    out_pos = self.mrope_positions[0, :batch_size]
+                elif (self.uses_xdrope_dim > 0
+                      and self.draft_uses_xdrope_dim > 0):
+                    out_pos = self.xdrope_positions[0, :batch_size]
+                else:
+                    out_pos = self.positions[:batch_size]
+                eagle_step_update_slot_mapping_and_metadata(
+                    positions_1d=positions_1d,
+                    block_table_tensor=(
+                        common_attn_metadata.block_table_tensor
+                    ),
+                    seq_lens=common_attn_metadata.seq_lens,
+                    block_size=block_size,
+                    max_model_len=self.max_model_len,
+                    out_clamped_positions=out_pos,
+                    out_slot_mapping=self._slot_mapping_buffer[
+                        :input_batch_size
+                    ],
+                    input_batch_size=input_batch_size,
+                )
+                common_attn_metadata.slot_mapping = (
+                    self._slot_mapping_buffer[:batch_size]
+                )
+                if self.uses_mrope:
+                    self.mrope_positions[1:, :batch_size] = (
+                        self.mrope_positions[0, :batch_size]
+                    )
+                    positions = self.mrope_positions[:, :batch_size]
+                elif (self.uses_xdrope_dim > 0
+                      and self.draft_uses_xdrope_dim > 0):
+                    self.xdrope_positions[1:, :batch_size] = (
+                        self.xdrope_positions[0, :batch_size]
+                    )
+                    positions = self.xdrope_positions[0, :batch_size]
+                else:
+                    positions = self.positions[:batch_size]
+                common_attn_metadata.max_seq_len = min(
+                    common_attn_metadata.max_seq_len + 1,
+                    self.max_model_len,
+                )
+                if common_attn_metadata._seq_lens_cpu is not None:
+                    common_attn_metadata._seq_lens_cpu += 1
+                if (common_attn_metadata._num_computed_tokens_cpu
+                        is not None):
+                    common_attn_metadata._num_computed_tokens_cpu += 1
 
-            _t4 = _t.perf_counter()
-            _prof_times["ctx_fwd"] = _prof_times.get("ctx_fwd", 0) + _t4 - _t3
+                _t1 = _t.perf_counter()
+                _prof_times["update"] += _t1 - _t0
 
-            hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
-            draft_token_ids_list.append(draft_token_ids)
-            _t5 = _t.perf_counter()
-            _prof_times["sample"] += _t5 - _t4
-        finally:
-          _fwd_ctx_module._forward_context = _prev_fwd_ctx
+                if _cached_group_metadata is None:
+                    _, per_layer_attn_metadata = (
+                        self.build_per_group_and_layer_attn_metadata(
+                            common_attn_metadata,
+                            draft_index=token_index + 1,
+                        )
+                    )
+                    _cached_group_metadata = list({
+                        id(md): md
+                        for md in per_layer_attn_metadata.values()
+                    }.values())
+                else:
+                    for md in _cached_group_metadata:
+                        md.max_seq_len = (
+                            common_attn_metadata.max_seq_len
+                        )
 
-        # Log drafter loop profiling every 50 calls
-        if not hasattr(self, '_prof_call_count'):
-            self._prof_call_count = 0
-            self._prof_accum = {k: 0.0 for k in _prof_times}
-        self._prof_call_count += 1
-        for k, v in _prof_times.items():
-            self._prof_accum[k] = self._prof_accum.get(k, 0.0) + v
-        if self._prof_call_count % 50 == 0:
-            parts = " ".join(f"{k}={self._prof_accum[k]/50*1000:.2f}ms"
-                             for k in ["update", "metadata", "copy", "ctx_fwd", "sample"])
-            total = sum(self._prof_accum.values()) / 50 * 1000
-            logger.info("DRAFTER_PROFILE calls=%d (per-call avg, %d iters): %s total=%.2fms",
-                        self._prof_call_count, self.num_speculative_tokens - 1, parts, total)
-            self._prof_accum = {k: 0.0 for k in self._prof_accum}
+                _drafter_fwd_ctx.attn_metadata = (
+                    per_layer_attn_metadata
+                )
+                _drafter_fwd_ctx.slot_mapping = (
+                    self._get_slot_mapping(input_batch_size)
+                )
+
+                _t2 = _t.perf_counter()
+                _prof_times["metadata"] += _t2 - _t1
+
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
+                if self.supports_mm_inputs:
+                    self.inputs_embeds[:batch_size] = (
+                        self.model.embed_input_ids(input_ids)
+                    )
+                    _model_kwargs["input_ids"] = None
+                    _model_kwargs["inputs_embeds"] = (
+                        self.inputs_embeds[:input_batch_size]
+                    )
+                else:
+                    _model_kwargs["input_ids"] = (
+                        self.input_ids[:input_batch_size]
+                    )
+                    _model_kwargs["inputs_embeds"] = None
+                _model_kwargs["positions"] = self._get_positions(
+                    input_batch_size
+                )
+                if self.pass_hidden_states_to_model:
+                    _model_kwargs["hidden_states"] = (
+                        self.hidden_states[:input_batch_size]
+                    )
+
+                _t3 = _t.perf_counter()
+                _prof_times["copy"] += _t3 - _t2
+
+                ret_hidden_states = self.model(**_model_kwargs)
+                if not self.model_returns_tuple():
+                    last_hidden_states = ret_hidden_states
+                    hidden_states = ret_hidden_states
+                else:
+                    last_hidden_states, hidden_states = (
+                        ret_hidden_states
+                    )
+
+                _t4 = _t.perf_counter()
+                _prof_times["ctx_fwd"] += _t4 - _t3
+
+                hidden_states = hidden_states[:batch_size]
+                draft_token_ids = self._greedy_sample(
+                    last_hidden_states[:batch_size]
+                )
+                draft_token_ids_list.append(draft_token_ids)
+                _t5 = _t.perf_counter()
+                _prof_times["sample"] += _t5 - _t4
+            finally:
+              _fwd_ctx_module._forward_context = _prev_fwd_ctx
+
+            if not hasattr(self, '_prof_call_count'):
+                self._prof_call_count = 0
+                self._prof_accum = {k: 0.0 for k in _prof_times}
+            self._prof_call_count += 1
+            for k, v in _prof_times.items():
+                self._prof_accum[k] = self._prof_accum.get(k, 0) + v
+            if self._prof_call_count % 50 == 0:
+                parts = " ".join(
+                    f"{k}={self._prof_accum[k]/50*1000:.2f}ms"
+                    for k in ["update", "metadata", "copy",
+                              "ctx_fwd", "sample"]
+                )
+                total = sum(self._prof_accum.values()) / 50 * 1000
+                logger.info(
+                    "DRAFTER_PROFILE calls=%d (per-call avg, %d "
+                    "iters): %s total=%.2fms (PIECEWISE fallback)",
+                    self._prof_call_count,
+                    self.num_speculative_tokens - 1, parts, total,
+                )
+                self._prof_accum = {k: 0 for k in self._prof_accum}
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
