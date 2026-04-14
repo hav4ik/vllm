@@ -1428,8 +1428,42 @@ class GPUModelRunner(
                             layer._spec_inited[old_pos])
                         layer._spec_inited[old_pos] = False
 
-        # Allow attention backend to reorder the batch, potentially
+        # Allow attention backend to reorder the batch. Track moves
+        # so we can swap spec slots for any reorder swaps.
+        num_moved_before_reorder = (
+            len(self.input_batch.batch_update_builder.moved)
+            if self._pc_spec_layers else 0
+        )
         self._may_reorder_batch(scheduler_output)
+
+        # Swap mamba spec slots for any positions the reorder swapped.
+        if self._pc_spec_layers:
+            reorder_moves = self.input_batch.batch_update_builder.moved[
+                num_moved_before_reorder:
+            ]
+            if reorder_moves:
+                for layer in self._pc_spec_layers:
+                    if layer.spec_ssm is None:
+                        continue
+                    S = layer._spec_slots_per_req
+                    for i1, i2, direction in reorder_moves:
+                        base1 = 1 + i1 * S
+                        base2 = 1 + i2 * S
+                        s1 = slice(base1, base1 + S)
+                        s2 = slice(base2, base2 + S)
+                        # Swap SSM state
+                        tmp = layer.spec_ssm[s1].clone()
+                        layer.spec_ssm[s1] = layer.spec_ssm[s2]
+                        layer.spec_ssm[s2] = tmp
+                        # Swap conv state
+                        tmp = layer.spec_conv[s1].clone()
+                        layer.spec_conv[s1] = layer.spec_conv[s2]
+                        layer.spec_conv[s2] = tmp
+                        # Swap inited flag
+                        f1 = layer._spec_inited[i1].item()
+                        layer._spec_inited[i1] = layer._spec_inited[i2]
+                        layer._spec_inited[i2] = f1
+
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
@@ -1613,6 +1647,14 @@ class GPUModelRunner(
         NOTE: prompt_token_ids includes intermediate output tokens - tokens
         previously generated but now are input context (part of the prompt).
         """
+        # Reset spec-slot init flag before removing, so the position
+        # is re-initialized when reused (same as finished-request path).
+        if self._pc_spec_layers:
+            batch_idx = self.input_batch.req_id_to_index.get(req_id)
+            if batch_idx is not None:
+                for layer in self._pc_spec_layers:
+                    if layer._spec_inited is not None:
+                        layer._spec_inited[batch_idx] = False
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
 
